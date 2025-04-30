@@ -29,11 +29,20 @@ type GetTaskArgs struct {
 	WorkerId string
 }
 
+type TaskType int
+
+const (
+	MapTaskType    TaskType = 0 // 任务尚未开始
+	ReduceTaskType TaskType = 1 // 任务已被分配给 worker 正在进行
+	WaitTaskType   TaskType = 2 // 任务已由 worker 成功完成
+	ExitTaskType   TaskType = 3
+)
+
 // coordinator需要回复的信息
 type GetTaskReply struct {
 	// 任务类型：Map, Reduce, Wait (当前无可用任务), Exit (所有任务完成，Worker 可以退出了)
 	// 使用枚举类型或者定义常量会比直接用字符串更健壮
-	TaskType int // 0: Map, 1: Reduce, 2: Wait, 3: Exit
+	Type TaskType // Map, Reduce, Wait, Exit
 
 	// --- Map 任务相关字段 (当 TaskType 为 Map 时有效) ---
 	FileName      string // Map 任务需要处理的输入文件
@@ -48,7 +57,7 @@ type GetTaskReply struct {
 	// 前者更简单，后者 Coordinator 职责更重。考虑到实验的简单性，让 Worker 自己找可能更容易实现。
 	// 所以这里可能只需要 ReduceTaskNumber。
 	// 如果决定让 Worker 自己找，可能 Worker 还需要知道总共有多少 Map 任务来确认所有相关的中间文件都已生成。
-	// NMap int // 总共有多少个 Map 任务 (可能有助于 Reduce Worker 确认中间文件集)
+	NMap int // 总共有多少个 Map 任务 (可能有助于 Reduce Worker 确认中间文件集)
 
 	// --- Wait 任务相关字段 (当 TaskType 为 Wait 时有效) ---
 	// 不需要额外信息

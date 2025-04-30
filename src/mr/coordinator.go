@@ -64,7 +64,7 @@ type Coordinator struct {
 	// 输入文件列表：通常直接存储在 MapTasks 结构中，但也可以单独存储
 	// InputFiles []string // 备选，如果 Task 结构中不存 InputFile
 
-	// 标记 Map 阶段是否已完成，可以开始 Reduce 阶段了
+	// 标记map阶段是否完成
 	MapPhaseCompleted bool
 
 	// 标记整个 MapReduce 作业是否已完成
@@ -76,7 +76,7 @@ type Coordinator struct {
 // 每个 RPC 处理函数都应该是一个 Coordinator 结构体的方法，
 // 接收一个指向请求参数结构体的指针和一个指向回复结构体的指针，并返回一个 error。
 
-// TODO: 实现coordinator的请求回复
+// 实现coordinator的请求回复
 func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -84,13 +84,62 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 	// 检查Job是否完成
 	if c.JobCompleted {
 		// 任务完成, 告知worker exit
-		reply.TaskType = 3
+		reply.Type = ExitTaskType
+		return nil
 	}
 
+	// 如果 Map 阶段尚未完成
 	if !c.MapPhaseCompleted {
-		reply.TaskType = 0
+		// 尝试寻找未开始或超时的 Map 任务
+		for i := range c.MapTasks {
+			if c.MapTasks[i].State == Unstarted ||
+				(c.MapTasks[i].State == InProgress && time.Since(c.MapTasks[i].StartTime) > 10*time.Second) {
+				// 找到了 Map 任务，分配给 Worker
+				c.MapTasks[i].State = InProgress
+				c.MapTasks[i].StartTime = time.Now()
+				c.MapTasks[i].WorkerID = args.WorkerId
 
+				reply.Type = MapTaskType
+				reply.FileName = c.MapTasks[i].InputFile
+				reply.MapTaskNumber = c.MapTasks[i].TaskID // Map TaskID 就是其在 MapTasks 列表中的索引
+				reply.NReduce = c.NReduce
+				return nil // 任务已分配，返回
+			}
+		}
+		// 如果 Map 阶段未完成但没有可分配的 Map 任务 (所有 Map 任务都在 InProgress 且未超时)
+		reply.Type = WaitTaskType
+		return nil // 告知 Worker 等待
 	}
+
+	// 如果 Reduce 阶段尚未完成
+	if c.ReduceCompletedCount < len(c.ReduceTasks) {
+		for i := range c.ReduceTasks {
+			if c.ReduceTasks[i].State == Unstarted ||
+				(c.ReduceTasks[i].State == InProgress && time.Since(c.ReduceTasks[i].StartTime) > 10*time.Second) {
+				// 找到了 Reduce 任务，分配给 Worker
+				c.ReduceTasks[i].State = InProgress
+				c.ReduceTasks[i].StartTime = time.Now()
+				c.ReduceTasks[i].WorkerID = args.WorkerId
+
+				reply.Type = ReduceTaskType
+				reply.ReduceTaskNumber = c.ReduceTasks[i].TaskID // Reduce TaskID 就是其在 ReduceTasks 列表中的索引
+				reply.NMap = len(c.MapTasks)                     // 可能 Worker 需要知道总 Map 任务数来查找中间文件
+				return nil                                       // 任务已分配，返回
+			}
+		}
+
+		// 如果 Reduce 阶段未完成但没有可分配的 Reduce 任务 (所有 Reduce 任务都在 InProgress 且未超时)
+		reply.Type = WaitTaskType
+		return nil // 告知 Worker 等待
+	}
+
+	// 如果 Map 阶段和 Reduce 阶段都已完成
+	// 这意味着整个作业已完成 (尽管我们已经在函数开头检查了 JobCompleted)
+	// 但这个地方是 c.MapPhaseCompleted 和 ReduceCompletedCount == c.NReduce 都满足时到达的，
+	// 可以在这里设置 JobCompleted = true，并告知 Worker 退出)
+	c.JobCompleted = true // 确保标志设置
+	reply.Type = ExitTaskType
+	return nil // 告知 Worker 退出
 }
 
 // Example an example RPC handler.
@@ -173,10 +222,10 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	// - 初始化 worker 的状态
 	// - 可能需要启动定时器来检测 worker 是否超时等
 	c.JobCompleted = false
-	c.MapPhaseCompleted = false
 	c.NReduce = nReduce
 	c.MapCompletedCount = 0
 	c.ReduceCompletedCount = 0
+	c.MapPhaseCompleted = false
 	c.MapTasks = make([]Task, 0, len(files))
 	for i, file := range files {
 		c.MapTasks = append(c.MapTasks, Task{
