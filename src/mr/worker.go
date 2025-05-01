@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"time"
 )                 // 导入 fmt 包，用于格式化输入输出
@@ -63,9 +64,11 @@ func Worker(mapf func(string, string) []KeyValue,
 		case MapTaskType:
 			// 执行map任务
 			performMapTask(mapf, reply.FileName, reply.MapTaskNumber, reply.NReduce)
-			// TODO: 报告任务完成
+			// TODO: 报告map任务完成
 		case ReduceTaskType:
 			// 执行reduce任务
+			performReduceTask(reducef, reply.ReduceTaskNumber, reply.NMap)
+			// TODO: 报告reduce任务完成
 		case WaitTaskType:
 			time.Sleep(WorkerWaitInterval)
 		case ExitTaskType:
@@ -104,20 +107,13 @@ func performMapTask(mapf func(string, string) []KeyValue, filename string, mapTa
 
 	// 4. 将每个桶的 KeyValue 对写入对应的中间文件
 	for r := 0; r < nReduce; r++ {
-		// 只有当这个桶有数据时才创建文件
-		if len(intermediate[r]) == 0 {
-			continue // 如果桶为空，不需要创建中间文件
-		}
-
 		// 确定最终的中间文件名: mr-MapTaskNumber-ReduceTaskNumber
 		finalFileName := fmt.Sprintf("mr-%d-%d", mapTaskNumber, r)
 
 		// 使用临时文件写入 (原子性保证)
-		// os.CreateTemp("", "mr-tmp-") 会在默认临时目录创建文件，以 "mr-tmp-" 开头
-		// 更好的做法是在当前目录下创建临时文件，方便后续 os.Rename
 		// 可以构建一个临时文件名的前缀，例如 "mr-MapTaskNumber-ReduceTaskNumber-temp-"
 		tempFilePattern := fmt.Sprintf("mr-%d-%d-temp-", mapTaskNumber, r)
-		tempFile, err := os.CreateTemp("", tempFilePattern) // 在系统默认临时目录创建
+		tempFile, err := os.CreateTemp(".", tempFilePattern) // 在系统默认临时目录创建
 		if err != nil {
 			log.Fatalf("无法创建临时中间文件 %s: %v", tempFilePattern, err)
 		}
@@ -153,8 +149,83 @@ func performMapTask(mapf func(string, string) []KeyValue, filename string, mapTa
 
 func performReduceTask(reducef func(string, []string) string, reduceTaskNumber int, nMap int) {
 	// 读取中间文件内容, 第i个map任务生成中间文件mr-i-*, 因此我们要读取所有的mr-*-reduceTaskNumber文件
+	// 存储当前编号的reduce桶的所有键值对
+	var intermediate []KeyValue
 	for i := 0; i < nMap; i++ {
+		// 每个中间文件都包含一系列的键值对
+		mapFileName := fmt.Sprintf("mr-%d-%d", i, reduceTaskNumber)
 
+		// 读取json文件内容, 获得键值对
+		file, err := os.Open(mapFileName)
+		if err != nil {
+			log.Fatalf("错误：打开文件 '%s' 失败：%v\n", mapFileName, err)
+		}
+		defer file.Close()
+
+		var data []KeyValue
+		decoder := json.NewDecoder(file)
+		err = decoder.Decode(&data)
+		if err != nil {
+			log.Fatalf("无法解码中间文件 %s: %v", file.Name(), err)
+		}
+
+		intermediate = append(intermediate, data...)
+	}
+
+	// 升序排序intermediate
+	sort.Slice(intermediate, func(i, j int) bool {
+		return intermediate[i].Key < intermediate[j].Key
+	})
+
+	// 创建临时文件, 指定最终生成的文件名
+	finalFileName := fmt.Sprintf("mr-out-%d", reduceTaskNumber)
+	tempFilePattern := fmt.Sprintf("mr-out-%d-temp-", reduceTaskNumber)
+	tempFile, err := os.CreateTemp(".", tempFilePattern)
+	if err != nil {
+		// 如果连临时文件都创建不了，这个 Reduce 任务也无法继续
+		log.Fatalf("ReduceTask %d: 无法创建临时输出文件 %s: %v", reduceTaskNumber, tempFilePattern, err)
+	}
+	defer tempFile.Close()
+
+	// 遍历排序后的中间数据，按键分组值。
+	// 对于每个不同的键，调用 Reduce 函数，传入键和所有关联的值。
+	// 将 Reduce 函数的输出（归约后的值）连同键一起写入一个名为 "mr-out-0" 的输出文件。
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		_, err = fmt.Fprintf(tempFile, "%v %v\n", intermediate[i].Key, output)
+		if err != nil {
+			// 写入临时文件失败是致命错误
+			log.Fatalf("ReduceTask %d: 写入临时输出文件 %s 失败: %v", reduceTaskNumber, tempFile.Name(), err)
+			// 在这里 log.Fatalf 会导致程序退出，所以不需要额外的清理代码
+		}
+
+		i = j
+	}
+
+	// 关闭临时文件 (重要，确保数据被刷新到磁盘)
+	err = tempFile.Close()
+	if err != nil {
+		// 关闭失败，也报告错误
+		log.Fatalf("无法关闭临时中间文件 %s: %v", tempFile.Name(), err)
+	}
+
+	// 原子重命名临时文件为最终文件名
+	err = os.Rename(tempFile.Name(), finalFileName)
+	if err != nil {
+		// 重命名失败，报告错误
+		os.Remove(tempFile.Name()) // 尝试清理
+		log.Fatalf("无法重命名临时文件 %s 到 %s: %v", tempFile.Name(), finalFileName, err)
 	}
 }
 
