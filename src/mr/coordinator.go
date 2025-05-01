@@ -142,6 +142,10 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 	return nil // 告知 Worker 退出
 }
 
+// TODO: HandleMapTaskComplete
+
+// TODO: HandleReduceTaskComplete
+
 // Example an example RPC handler.
 // RPC 的请求参数和回复类型定义在 rpc.go 文件中。
 //

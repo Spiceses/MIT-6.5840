@@ -1,7 +1,13 @@
 package mr // 定义 mr 包，包含 MapReduce worker 的实现
 
 // 导入所需的包
-import "fmt"      // 导入 fmt 包，用于格式化输入输出
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"strconv"
+	"time"
+)                 // 导入 fmt 包，用于格式化输入输出
 import "log"      // 导入 log 包，用于记录日志
 import "net/rpc"  // 导入 net/rpc 包，用于 Go 语言的 RPC (远程过程调用)
 import "hash/fnv" // 导入 hash/fnv 包，用于实现 FNV 哈希算法，这里用于对 key 进行哈希
@@ -26,6 +32,9 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+// WorkerWaitInterval 定义 Worker 等待任务时的间隔常量
+const WorkerWaitInterval = 100 * time.Millisecond
+
 // main/mrworker.go 调用此函数来启动一个 worker 进程。
 //
 // Worker 函数是 MapReduce worker 的主执行逻辑。
@@ -39,7 +48,9 @@ func Worker(mapf func(string, string) []KeyValue,
 	// 并向协调器报告任务完成或遇到的错误。
 	for {
 		// 向 Coordinator 请求任务
-		args := GetTaskArgs{}
+		args := GetTaskArgs{
+			WorkerId: strconv.Itoa(os.Getpid()),
+		}
 		reply := GetTaskReply{}
 		ok := call("Coordinator.HandleGetTask", &args, &reply)
 		if ok == false {
@@ -48,12 +59,103 @@ func Worker(mapf func(string, string) []KeyValue,
 		}
 
 		// 处理 Coordinator 的回复
-
+		switch reply.Type {
+		case MapTaskType:
+			// 执行map任务
+			performMapTask(mapf, reply.FileName, reply.MapTaskNumber, reply.NReduce)
+			// TODO: 报告任务完成
+		case ReduceTaskType:
+			// 执行reduce任务
+		case WaitTaskType:
+			time.Sleep(WorkerWaitInterval)
+		case ExitTaskType:
+			break
+		}
 	}
 
 	// 取消注释此行可以向协调器发送一个示例 RPC 调用，用于测试通信。
 	// CallExample()
 
+}
+
+func performMapTask(mapf func(string, string) []KeyValue, filename string, mapTaskNumber int, nReduce int) {
+	// 读取文件内容
+	content, err := os.ReadFile(filename)
+	if err != nil {
+		log.Fatalf("无法读取文件 %s: %v", filename, err) // 处理文件读取错误
+	}
+
+	// 应用map操作
+	kva := mapf(filename, string(content))
+
+	// 按 Reduce 桶分区 KeyValue 对
+	// 创建一个临时的缓冲区，用于存放分配到每个 Reduce 桶的 KeyValue 对
+	// 我们可以使用一个 []([]mr.KeyValue) 或一个 map[int][]mr.KeyValue
+	// []([]mr.KeyValue) 更直接，大小固定为 nReduce
+	intermediate := make([][]KeyValue, nReduce)
+
+	for _, kv := range kva {
+		// 计算这个 KeyValue 对应该去哪个 Reduce 桶
+		reduceTaskNumber := ihash(kv.Key) % nReduce
+
+		// 将 KeyValue 对添加到对应桶的缓冲区
+		intermediate[reduceTaskNumber] = append(intermediate[reduceTaskNumber], kv)
+	}
+
+	// 4. 将每个桶的 KeyValue 对写入对应的中间文件
+	for r := 0; r < nReduce; r++ {
+		// 只有当这个桶有数据时才创建文件
+		if len(intermediate[r]) == 0 {
+			continue // 如果桶为空，不需要创建中间文件
+		}
+
+		// 确定最终的中间文件名: mr-MapTaskNumber-ReduceTaskNumber
+		finalFileName := fmt.Sprintf("mr-%d-%d", mapTaskNumber, r)
+
+		// 使用临时文件写入 (原子性保证)
+		// os.CreateTemp("", "mr-tmp-") 会在默认临时目录创建文件，以 "mr-tmp-" 开头
+		// 更好的做法是在当前目录下创建临时文件，方便后续 os.Rename
+		// 可以构建一个临时文件名的前缀，例如 "mr-MapTaskNumber-ReduceTaskNumber-temp-"
+		tempFilePattern := fmt.Sprintf("mr-%d-%d-temp-", mapTaskNumber, r)
+		tempFile, err := os.CreateTemp("", tempFilePattern) // 在系统默认临时目录创建
+		if err != nil {
+			log.Fatalf("无法创建临时中间文件 %s: %v", tempFilePattern, err)
+		}
+
+		// 使用 JSON 编码器写入 KeyValue 对
+		encoder := json.NewEncoder(tempFile)
+		err = encoder.Encode(intermediate[r]) // 编码整个 []KeyValue 切片
+		if err != nil {
+			// 写入失败，清理临时文件并报告错误
+			tempFile.Close()
+			os.Remove(tempFile.Name()) // 尝试删除未完成的临时文件
+			log.Fatalf("无法编码并写入中间文件 %s: %v", tempFile.Name(), err)
+		}
+
+		// 关闭临时文件 (重要，确保数据被刷新到磁盘)
+		err = tempFile.Close()
+		if err != nil {
+			// 关闭失败，也报告错误
+			log.Fatalf("无法关闭临时中间文件 %s: %v", tempFile.Name(), err)
+		}
+
+		// 原子重命名临时文件为最终文件名
+		err = os.Rename(tempFile.Name(), finalFileName)
+		if err != nil {
+			// 重命名失败，报告错误
+			os.Remove(tempFile.Name()) // 尝试清理
+			log.Fatalf("无法重命名临时文件 %s 到 %s: %v", tempFile.Name(), finalFileName, err)
+		}
+
+		// log.Printf("Map 任务 %d 成功写入中间文件 %s\n", mapTaskNumber, finalFileName) // 调试日志
+	}
+}
+
+func performReduceTask(reducef func(string, []string) string, reduceTaskNumber int, nMap int) {
+	// 读取中间文件内容, 第i个map任务生成中间文件mr-i-*, 因此我们要读取所有的mr-*-reduceTaskNumber文件
+	for i := 0; i < nMap; i++ {
+
+	}
 }
 
 // 这是一个示例函数，展示如何向协调器发起一个 RPC 调用。
