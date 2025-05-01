@@ -143,8 +143,12 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 }
 
 // TODO: HandleMapTaskComplete
+func (c *Coordinator) handleMapTaskComplete(args *MapTaskCompleteArgs, reply *MapTaskCompleteReply) error {
+}
 
 // TODO: HandleReduceTaskComplete
+func (c *Coordinator) handleReduceTaskComplete(args *ReduceTaskCompleteArgs, reply *ReduceTaskCompleteReply) error {
+}
 
 // Example an example RPC handler.
 // RPC 的请求参数和回复类型定义在 rpc.go 文件中。
@@ -198,9 +202,11 @@ func (c *Coordinator) Done() bool {
 	// ret 变量用于存储作业是否完成的状态，默认为 false
 	ret := false
 
-	// Your code here.
 	// 在这里实现判断作业是否完成的逻辑。
 	// 你需要根据协调器维护的任务状态来判断所有任务是否都已成功完成。
+	if c.JobCompleted {
+		ret = true
+	}
 
 	// 返回作业完成状态
 	return ret

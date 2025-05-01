@@ -229,6 +229,14 @@ func performReduceTask(reducef func(string, []string) string, reduceTaskNumber i
 	}
 }
 
+// TODO: 使用RPC报告map任务完成
+func reportMapCompletion() {
+
+}
+
+// TODO: 使用RPC报告reduce任务完成
+func reportReduceCompletion() {}
+
 // 这是一个示例函数，展示如何向协调器发起一个 RPC 调用。
 // RPC 的请求参数和回复类型定义在 rpc.go 文件中。
 // CallExample 函数向协调器的 Example RPC 方法发起调用。

@@ -66,6 +66,17 @@ type GetTaskReply struct {
 	// 不需要额外信息
 }
 
+// TODO: 设计任务完成的请求和回复参数
+
+type MapTaskCompleteArgs struct {
+}
+
+type MapTaskCompleteReply struct{}
+
+type ReduceTaskCompleteArgs struct{}
+
+type ReduceTaskCompleteReply struct{}
+
 // 生成一个相对唯一的 UNIX 域套接字名称
 // 放在 /var/tmp 目录下，供coordinator使用。
 // 不能使用当前目录，因为
