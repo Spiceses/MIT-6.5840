@@ -230,8 +230,13 @@ func performReduceTask(reducef func(string, []string) string, reduceTaskNumber i
 }
 
 // TODO: 使用RPC报告map任务完成
-func reportMapCompletion() {
+func reportMapCompletion(mapTaskNumber int) {
+	args := MapTaskCompleteArgs{
+		MapTaskNumber: mapTaskNumber,
+	}
+	reply := MapTaskCompleteReply{}
 
+	ok := call("Coordinator.MapTaskComplete", &args, &reply)
 }
 
 // TODO: 使用RPC报告reduce任务完成

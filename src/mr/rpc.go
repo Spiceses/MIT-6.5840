@@ -66,8 +66,6 @@ type GetTaskReply struct {
 	// 不需要额外信息
 }
 
-// TODO: 设计任务完成的请求和回复参数
-
 type MapTaskCompleteArgs struct {
 	MapTaskNumber int
 }
@@ -75,7 +73,9 @@ type MapTaskCompleteArgs struct {
 type MapTaskCompleteReply struct {
 }
 
-type ReduceTaskCompleteArgs struct{}
+type ReduceTaskCompleteArgs struct {
+	ReduceTaskNumber int
+}
 
 type ReduceTaskCompleteReply struct{}
 

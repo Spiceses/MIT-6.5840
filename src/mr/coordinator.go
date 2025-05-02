@@ -65,7 +65,6 @@ type Coordinator struct {
 }
 
 // Your code here -- RPC handlers for the worker to call.
-// TODO: 在这里实现供 worker调用的 RPC 处理函数。
 // 每个 RPC 处理函数都应该是一个 Coordinator 结构体的方法，
 // 接收一个指向请求参数结构体的指针和一个指向回复结构体的指针，并返回一个 error。
 
@@ -135,9 +134,9 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 	return nil // 告知 Worker 退出
 }
 
-// map任务完成, 我们需要更新Coordinator状态
+// Map任务完成, 我们需要更新Coordinator状态
 // 具体来说, 我们要更新MapTasks, MapCompletedCount, MapPhaseCompleted字段
-func (c *Coordinator) handleMapTaskComplete(args *MapTaskCompleteArgs, reply *MapTaskCompleteReply) error {
+func (c *Coordinator) HandleMapTaskComplete(args *MapTaskCompleteArgs, reply *MapTaskCompleteReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -162,9 +161,30 @@ func (c *Coordinator) handleMapTaskComplete(args *MapTaskCompleteArgs, reply *Ma
 	return nil
 }
 
-// TODO: HandleReduceTaskComplete
-func (c *Coordinator) handleReduceTaskComplete(args *ReduceTaskCompleteArgs, reply *ReduceTaskCompleteReply) error {
+// Reduce任务完成, 我们需要更新Coordinator状态
+// 具体来说, 我们要更新ReduceTasks, ReduceCompletedCount, JobCompleted字段
+func (c *Coordinator) HandleReduceTaskComplete(args *ReduceTaskCompleteArgs, reply *ReduceTaskCompleteReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	if args.ReduceTaskNumber < 0 || args.ReduceTaskNumber >= len(c.ReduceTasks) {
+		// 可以选择记录错误日志
+		log.Printf("Received completion report for invalid Reduce task number: %d", args.ReduceTaskNumber)
+		// 返回一个错误，或者 nil 如果你选择忽略无效报告
+		return fmt.Errorf("invalid Reduce task number: %d", args.ReduceTaskNumber) // 返回错误更严谨
+	}
+
+	if c.ReduceTasks[args.ReduceTaskNumber].State == Completed {
+		return nil
+	}
+
+	c.ReduceTasks[args.ReduceTaskNumber].State = Completed
+	c.ReduceCompletedCount++
+	if c.ReduceCompletedCount == len(c.ReduceTasks) {
+		c.JobCompleted = true
+	}
+
+	return nil
 }
 
 // Example an example RPC handler.
@@ -208,25 +228,15 @@ func (c *Coordinator) server() {
 	go http.Serve(l, nil)
 }
 
-// main/mrcoordinator.go calls Done() periodically to find out
-// if the entire job has finished.
 // main/mrcoordinator.go 会周期性地调用 Done() 函数来判断
 // 整个 MapReduce 作业是否已经完成。
-//
 // Done 方法检查整个 MapReduce 作业是否已经完成
 // 当所有 Map 任务和 Reduce 任务都完成后，此方法应返回 true
 func (c *Coordinator) Done() bool {
-	// ret 变量用于存储作业是否完成的状态，默认为 false
-	ret := false
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	// 在这里实现判断作业是否完成的逻辑。
-	// 你需要根据协调器维护的任务状态来判断所有任务是否都已成功完成。
-	if c.JobCompleted {
-		ret = true
-	}
-
-	// 返回作业完成状态
-	return ret
+	return c.JobCompleted
 }
 
 // create a Coordinator.
