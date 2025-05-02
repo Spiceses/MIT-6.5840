@@ -1,7 +1,10 @@
 package mr // 定义 mr 包，包含 MapReduce 协调器的实现
 
 // 导入所需的包
-import "log"      // 导入 log 包，用于记录日志和致命错误
+import (
+	"fmt"
+	"log"
+)                 // 导入 log 包，用于记录日志和致命错误
 import "net"      // 导入 net 包，用于网络连接，这里用于创建监听器
 import "os"       // 导入 os 包，用于访问操作系统功能，这里用于删除旧的 socket 文件
 import "net/rpc"  // 导入 net/rpc 包，用于 Go 语言的 RPC (远程过程调用)
@@ -31,16 +34,6 @@ type Task struct {
 // Coordinator 是协调器的主体结构体
 // 它负责管理 MapReduce 任务的状态、分配任务给 worker 以及跟踪任务的完成情况
 type Coordinator struct {
-	// 在这里定义你的协调器需要维护的状态信息
-	// 例如：
-	// - 输入文件列表
-	// - Map 任务的状态 (等待中、进行中、已完成)
-	// - Reduce 任务的状态 (等待中、进行中、已完成)
-	// - worker 的信息或状态
-	// - 锁或其他同步机制来保护共享数据
-	// - 存储中间结果的结构体 (尽管通常是 worker 直接写入文件)
-	// Your definitions here.
-
 	// 互斥锁：保护 Coordinator 结构体中的共享状态，防止并发访问导致数据竞争
 	mu sync.Mutex
 
@@ -142,12 +135,36 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 	return nil // 告知 Worker 退出
 }
 
-// TODO: HandleMapTaskComplete
+// map任务完成, 我们需要更新Coordinator状态
+// 具体来说, 我们要更新MapTasks, MapCompletedCount, MapPhaseCompleted字段
 func (c *Coordinator) handleMapTaskComplete(args *MapTaskCompleteArgs, reply *MapTaskCompleteReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// 检查任务编号是否有效，避免越界 panic
+	if args.MapTaskNumber < 0 || args.MapTaskNumber >= len(c.MapTasks) {
+		// 可以选择记录错误日志
+		log.Printf("Received completion report for invalid Map task number: %d", args.MapTaskNumber)
+		// 返回一个错误，或者 nil 如果你选择忽略无效报告
+		return fmt.Errorf("invalid map task number: %d", args.MapTaskNumber) // 返回错误更严谨
+	}
+
+	if c.MapTasks[args.MapTaskNumber].State == Completed {
+		return nil
+	}
+
+	c.MapTasks[args.MapTaskNumber].State = Completed
+	c.MapCompletedCount++
+	if c.MapCompletedCount == len(c.MapTasks) {
+		c.MapPhaseCompleted = true
+	}
+
+	return nil
 }
 
 // TODO: HandleReduceTaskComplete
 func (c *Coordinator) handleReduceTaskComplete(args *ReduceTaskCompleteArgs, reply *ReduceTaskCompleteReply) error {
+
 }
 
 // Example an example RPC handler.
