@@ -13,6 +13,8 @@ import "log"      // 导入 log 包，用于记录日志
 import "net/rpc"  // 导入 net/rpc 包，用于 Go 语言的 RPC (远程过程调用)
 import "hash/fnv" // 导入 hash/fnv 包，用于实现 FNV 哈希算法，这里用于对 key 进行哈希
 
+var workerId string // Declare package-level variable
+
 // Map 函数返回一个 KeyValue 类型的slice。
 // KeyValue 结构体表示 Map 任务输出的键值对。
 type KeyValue struct {
@@ -42,21 +44,22 @@ const WorkerWaitInterval = 100 * time.Millisecond
 // mapf 是应用提供的 Map 函数，reducef 是应用提供的 Reduce 函数。
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	workerId = strconv.Itoa(os.Getpid())
 
-	// TODO: 在这里实现你的 worker 逻辑。
 	// 一个 worker 应该不断地向协调器请求任务（Map 或 Reduce），
 	// 执行任务（调用 mapf 或 reducef），
 	// 并向协调器报告任务完成或遇到的错误。
 	for {
 		// 向 Coordinator 请求任务
 		args := GetTaskArgs{
-			WorkerId: strconv.Itoa(os.Getpid()),
+			WorkerId: workerId,
 		}
 		reply := GetTaskReply{}
 		ok := call("Coordinator.HandleGetTask", &args, &reply)
 		if ok == false {
-			// RPC error
-			break
+			// RPC error - unable to get a task from the Coordinator
+			// This is a fatal error for the worker, as it cannot proceed without a task.
+			log.Fatalf("Worker %s: RPC call to Coordinator.HandleGetTask failed", args.WorkerId)
 		}
 
 		// 处理 Coordinator 的回复
@@ -64,11 +67,11 @@ func Worker(mapf func(string, string) []KeyValue,
 		case MapTaskType:
 			// 执行map任务
 			performMapTask(mapf, reply.FileName, reply.MapTaskNumber, reply.NReduce)
-			// TODO: 报告map任务完成
+			reportMapCompletion(reply.MapTaskNumber)
 		case ReduceTaskType:
 			// 执行reduce任务
 			performReduceTask(reducef, reply.ReduceTaskNumber, reply.NMap)
-			// TODO: 报告reduce任务完成
+			reportReduceCompletion(reply.ReduceTaskNumber)
 		case WaitTaskType:
 			time.Sleep(WorkerWaitInterval)
 		case ExitTaskType:
@@ -77,7 +80,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 
 	// 取消注释此行可以向协调器发送一个示例 RPC 调用，用于测试通信。
-	// CallExample()
+	//CallExample()
 
 }
 
@@ -229,18 +232,33 @@ func performReduceTask(reducef func(string, []string) string, reduceTaskNumber i
 	}
 }
 
-// TODO: 使用RPC报告map任务完成
 func reportMapCompletion(mapTaskNumber int) {
 	args := MapTaskCompleteArgs{
 		MapTaskNumber: mapTaskNumber,
 	}
 	reply := MapTaskCompleteReply{}
 
-	ok := call("Coordinator.MapTaskComplete", &args, &reply)
+	ok := call("Coordinator.HandleMapTaskComplete", &args, &reply)
+	if !ok {
+		// RPC error - unable to get a task from the Coordinator
+		// This is a fatal error for the worker, as it cannot proceed without a task.
+		log.Fatalf("Worker %s: RPC call to Coordinator.HandleMapTaskComplete failed", workerId)
+	}
 }
 
-// TODO: 使用RPC报告reduce任务完成
-func reportReduceCompletion() {}
+func reportReduceCompletion(reduceTaskNumber int) {
+	args := ReduceTaskCompleteArgs{
+		ReduceTaskNumber: reduceTaskNumber,
+	}
+	reply := ReduceTaskCompleteReply{}
+
+	ok := call("Coordinator.HandleReduceTaskComplete", &args, &reply)
+	if !ok {
+		// RPC error - unable to get a task from the Coordinator
+		// This is a fatal error for the worker, as it cannot proceed without a task.
+		log.Fatalf("Worker %s: RPC call to Coordinator.HandleReduceTaskComplete failed", workerId)
+	}
+}
 
 // 这是一个示例函数，展示如何向协调器发起一个 RPC 调用。
 // RPC 的请求参数和回复类型定义在 rpc.go 文件中。

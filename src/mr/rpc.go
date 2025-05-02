@@ -20,7 +20,7 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
-// TODO: 在这里添加你自己的 RPC 定义。
+// RPC 定义。
 // 根据 MapReduce 协调器和 worker 之间通信的需求，定义其他请求参数和回复结构体。
 // 例如，可能有用于请求任务、报告任务完成、获取 Reduce 任务数量等的 RPC 定义。
 
