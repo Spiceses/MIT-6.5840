@@ -70,8 +70,12 @@ type Coordinator struct {
 
 // 实现coordinator的请求回复
 func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) error {
+	//log.Printf("Coordinator: Received HandleGetTask RPC from worker %s", args.WorkerId)
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	//log.Println("Coordinator: Acquired lock in HandleGetTask")
 
 	// 检查Job是否完成
 	if c.JobCompleted {
@@ -79,6 +83,8 @@ func (c *Coordinator) HandleGetTask(args *GetTaskArgs, reply *GetTaskReply) erro
 		reply.Type = ExitTaskType
 		return nil
 	}
+
+	//log.Println("Coordinator: Acquired lock in HandleGetTask")
 
 	// 如果 Map 阶段尚未完成
 	if !c.MapPhaseCompleted {

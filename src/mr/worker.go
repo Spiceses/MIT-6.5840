@@ -13,6 +13,8 @@ import "log"      // 导入 log 包，用于记录日志
 import "net/rpc"  // 导入 net/rpc 包，用于 Go 语言的 RPC (远程过程调用)
 import "hash/fnv" // 导入 hash/fnv 包，用于实现 FNV 哈希算法，这里用于对 key 进行哈希
 
+const IntermediateFileNamePattern = "mr-out-%d-%d"
+
 var workerId string // Declare package-level variable
 
 // Map 函数返回一个 KeyValue 类型的slice。
@@ -75,7 +77,7 @@ func Worker(mapf func(string, string) []KeyValue,
 		case WaitTaskType:
 			time.Sleep(WorkerWaitInterval)
 		case ExitTaskType:
-			break
+			return
 		}
 	}
 
@@ -111,11 +113,11 @@ func performMapTask(mapf func(string, string) []KeyValue, filename string, mapTa
 	// 4. 将每个桶的 KeyValue 对写入对应的中间文件
 	for r := 0; r < nReduce; r++ {
 		// 确定最终的中间文件名: mr-MapTaskNumber-ReduceTaskNumber
-		finalFileName := fmt.Sprintf("mr-%d-%d", mapTaskNumber, r)
+		finalFileName := fmt.Sprintf(IntermediateFileNamePattern, mapTaskNumber, r)
 
 		// 使用临时文件写入 (原子性保证)
 		// 可以构建一个临时文件名的前缀，例如 "mr-MapTaskNumber-ReduceTaskNumber-temp-"
-		tempFilePattern := fmt.Sprintf("mr-%d-%d-temp-", mapTaskNumber, r)
+		tempFilePattern := fmt.Sprintf(IntermediateFileNamePattern+"-temp-", mapTaskNumber, r)
 		tempFile, err := os.CreateTemp(".", tempFilePattern) // 在系统默认临时目录创建
 		if err != nil {
 			log.Fatalf("无法创建临时中间文件 %s: %v", tempFilePattern, err)
@@ -156,7 +158,7 @@ func performReduceTask(reducef func(string, []string) string, reduceTaskNumber i
 	var intermediate []KeyValue
 	for i := 0; i < nMap; i++ {
 		// 每个中间文件都包含一系列的键值对
-		mapFileName := fmt.Sprintf("mr-%d-%d", i, reduceTaskNumber)
+		mapFileName := fmt.Sprintf(IntermediateFileNamePattern, i, reduceTaskNumber)
 
 		// 读取json文件内容, 获得键值对
 		file, err := os.Open(mapFileName)
