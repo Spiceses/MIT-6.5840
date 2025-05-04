@@ -13,7 +13,7 @@ import "log"      // 导入 log 包，用于记录日志
 import "net/rpc"  // 导入 net/rpc 包，用于 Go 语言的 RPC (远程过程调用)
 import "hash/fnv" // 导入 hash/fnv 包，用于实现 FNV 哈希算法，这里用于对 key 进行哈希
 
-const IntermediateFileNamePattern = "mr-out-%d-%d"
+const IntermediateFileNamePattern = "mr-%d-%d"
 
 var workerId string // Declare package-level variable
 
