@@ -14,7 +14,6 @@ type Clerk struct {
 
 func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 	ck := &Clerk{clnt: clnt, server: server}
-	// You may add code here.
 	return ck
 }
 
@@ -40,24 +39,27 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	return reply.Value, reply.Version, reply.Err
 }
 
-// Put updates key with value only if the version in the
-// request matches the version of the key at the server.  If the
-// versions numbers don't match, the server should return
-// ErrVersion.  If Put receives an ErrVersion on its first RPC, Put
-// should return ErrVersion, since the Put was definitely not
-// performed at the server. If the server returns ErrVersion on a
-// resend RPC, then Put must return ErrMaybe to the application, since
-// its earlier RPC might have been processed by the server successfully
-// but the response was lost, and the Clerk doesn't know if
-// the Put was performed or not.
+// Put 仅当请求中的版本号与服务器上键的版本号匹配时，才更新键的值。
+// 如果版本号不匹配，服务器应返回 ErrVersion。
+// 如果键不存在，当 args.Version 为 0 时，Put 安装该值，否则返回 ErrNoKey。
+// 如果 Put 在其第一次 RPC 调用时收到 ErrVersion，则 Put 应返回 ErrVersion，因为该 Put 肯定未在服务器上执行。
+// 如果服务器在一次重传的 RPC 调用时返回 ErrVersion，那么 Put 必须向应用程序返回 ErrMaybe，
+// 因为其早先的 RPC 可能已经被服务器成功处理但回复丢失了，Clerk 不知道 Put 是否被执行了。
 //
-// You can send an RPC with code like this:
+// 你可以使用类似这样的代码发送一个 RPC：
 // ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
 //
-// The types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. Additionally, reply must be passed as a pointer.
+// args 和 reply 的类型（包括它们是否是指针）
+// 必须与 RPC 处理程序函数声明的参数类型匹配。
+// 此外，reply 必须作为指针传递。
 func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
-	// You will have to modify this function.
-	return rpc.ErrNoKey
+	args := rpc.PutArgs{Key: key, Value: value, Version: version}
+	reply := rpc.PutReply{}
+
+	ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+	if !ok {
+		log.Fatal("call KVServer.Put fail")
+	}
+
+	return reply.Err
 }
