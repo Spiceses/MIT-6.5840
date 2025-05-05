@@ -4,8 +4,10 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/tester1"
-	"log"
+	"time"
 )
+
+const RetryWaitTime = time.Millisecond * 100
 
 type Clerk struct {
 	clnt   *tester.Clnt
@@ -30,10 +32,13 @@ func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	args := rpc.GetArgs{Key: key}
 	reply := rpc.GetReply{}
 
-	ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
-	if !ok {
-		// 在具有可靠网络的键值服务器时, 通信失败为致命错误
-		log.Fatal("call KVServer.Get fail")
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
+		if ok {
+			break
+		}
+		// 网络通信异常, 重新发送请求
+		time.Sleep(RetryWaitTime)
 	}
 
 	return reply.Value, reply.Version, reply.Err
@@ -56,9 +61,19 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	args := rpc.PutArgs{Key: key, Value: value, Version: version}
 	reply := rpc.PutReply{}
 
-	ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
-	if !ok {
-		log.Fatal("call KVServer.Put fail")
+	retry := false
+	for {
+		ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply)
+		if ok {
+			break
+		}
+		// 网络通信异常, 重新发送请求
+		retry = true
+		time.Sleep(RetryWaitTime)
+	}
+
+	if reply.Err == rpc.ErrVersion && retry {
+		reply.Err = rpc.ErrMaybe
 	}
 
 	return reply.Err
