@@ -55,7 +55,7 @@ func (lk *Lock) Acquire() {
 			break
 		}
 
-		// 检查rpc调用是否完成
+		// 检查Clerk.Get调用是否完成
 		if err != rpc.OK {
 			log.Fatal("Clerk.Get fail")
 		}
@@ -78,13 +78,17 @@ func (lk *Lock) Release() {
 		log.Fatal("尝试释放未持有的锁")
 	}
 
-	// 检查rpc调用是否完成
+	// 检查Clerk.Get调用是否完成
 	if err != rpc.OK {
 		log.Fatal("Clerk.Get fail")
 	}
 
 	// 尝试释放锁
 	err = lk.ck.Put(lk.key, EmptyID, version)
+	// 可能出现的情况: 第一次Put的回复丢失, 重新发送Put请求, 导致版本号对应不上, 这时Put会发送rpc.ErrMaybe, 此时这个错误可以忽略
+	if err == rpc.ErrMaybe {
+		return
+	}
 	// 检查释放锁是否失败
 	if err != rpc.OK {
 		log.Fatal("释放锁失败")
