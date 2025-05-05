@@ -28,7 +28,6 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 // 必须与 RPC 处理程序函数声明的参数类型匹配。
 // 此外，reply 必须作为指针传递。
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
-	// You will have to modify this function.
 	args := rpc.GetArgs{Key: key}
 	reply := rpc.GetReply{}
 
