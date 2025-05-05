@@ -4,8 +4,8 @@ import (
 	"6.5840/kvsrv1/rpc"
 	"6.5840/kvtest1"
 	"6.5840/tester1"
+	"log"
 )
-
 
 type Clerk struct {
 	clnt   *tester.Clnt
@@ -18,19 +18,27 @@ func MakeClerk(clnt *tester.Clnt, server string) kvtest.IKVClerk {
 	return ck
 }
 
-// Get fetches the current value and version for a key.  It returns
-// ErrNoKey if the key does not exist. It keeps trying forever in the
-// face of all other errors.
+// Get 获取一个键的当前值和版本。
+// 如果键不存在，则返回 ErrNoKey。对于所有其他错误，它会一直尝试。
 //
-// You can send an RPC with code like this:
+// 你可以使用类似这样的代码发送一个 RPC：
 // ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
 //
-// The types of args and reply (including whether they are pointers)
-// must match the declared types of the RPC handler function's
-// arguments. Additionally, reply must be passed as a pointer.
+// args 和 reply 的类型（包括它们是否是指针）
+// 必须与 RPC 处理程序函数声明的参数类型匹配。
+// 此外，reply 必须作为指针传递。
 func (ck *Clerk) Get(key string) (string, rpc.Tversion, rpc.Err) {
 	// You will have to modify this function.
-	return "", 0, rpc.ErrNoKey
+	args := rpc.GetArgs{Key: key}
+	reply := rpc.GetReply{}
+
+	ok := ck.clnt.Call(ck.server, "KVServer.Get", &args, &reply)
+	if !ok {
+		// 在具有可靠网络的键值服务器时, 通信失败为致命错误
+		log.Fatal("call KVServer.Get fail")
+	}
+
+	return reply.Value, reply.Version, reply.Err
 }
 
 // Put updates key with value only if the version in the
