@@ -33,7 +33,7 @@ type Raft struct {
 
 	// Persistent state
 	currentTerm int
-	votedFor    string
+	votedFor    int
 	log         []Log
 
 	// Volatilestate
@@ -119,7 +119,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
 	Term         int
-	CandidateId  string
+	CandidateId  int
 	LastLogIndex int
 	LastLogTerm  int
 }
@@ -142,7 +142,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if rf.votedFor == "" || rf.votedFor == args.CandidateId {
+	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
 		// check candidate’s log is at least as up-to-date as receiver’s log
 		if args.LastLogTerm < rf.log[len(rf.log)-1].term {
 			reply.VoteGranted = false
@@ -262,6 +262,39 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	// TODO: 初始化raft状态
+	rf.currentTerm = 0
+	rf.log = make([]Log, 0)
+
+	// TODO: 创建一个后台 goroutine，当它一段时间没有收到其他对等体的消息时，它将通过发送 `RequestVote` RPC 定期启动领导者选举
+	go func() {
+		var lastLogIndex int
+		var lastLogTerm int
+
+		if len(rf.log) == 0 {
+			lastLogIndex = 0 // Raft 论文中空日志的索引为 0
+			lastLogTerm = 0  // Raft 论文中空日志的任期为 0
+		} else {
+			lastLogIndex = len(rf.log)
+			lastLogTerm = rf.log[len(rf.log)-1].term
+		}
+
+		args := RequestVoteArgs{
+			Term:         rf.currentTerm,
+			CandidateId:  me,
+			LastLogIndex: lastLogIndex,
+			LastLogTerm:  lastLogTerm,
+		}
+
+		var reply RequestVoteReply
+
+		for i := range peers {
+			if i == me {
+				continue
+			}
+			rf.sendRequestVote(i, &args, &reply)
+		}
+	}()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -270,4 +303,45 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderId     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []Log
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		return
+	}
+
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.Success = false
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].term != args.Term {
+		reply.Success = false
+		return
+	}
+
+	rf.commitIndex = args.LeaderCommit
+	reply.Success = true
+}
+
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
 }
