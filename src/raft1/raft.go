@@ -19,6 +19,12 @@ import (
 	tester "6.5840/tester1"
 )
 
+const (
+	Follower = iota
+	Candidate
+	Leader
+)
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -43,10 +49,14 @@ type Raft struct {
 	// Volatile state on leaders
 	nextIndex  []int
 	matchIndex []int
+
+	state           int
+	lastContact     time.Time
+	electionTimeout time.Duration
 }
 
 type Log struct {
-	command string
+	command interface{}
 	term    int
 }
 
@@ -203,6 +213,17 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
+//
+// 使用 Raft 的服务（例如键/值服务器）希望就要附加到 Raft 日志的下一个命令启动一致性协议。
+// 如果当前服务器不是 Leader，则返回 false。
+// 否则，立即启动一致性协议并返回。
+// 不保证此命令最终会提交到 Raft 日志，因为 Leader
+// 可能会失败或在选举中失利。
+// 即使 Raft 实例已被终止，此函数也应优雅地返回。
+//
+// 第一个返回值是如果命令最终被提交，它将出现的日志索引。
+// 第二个返回值是当前任期。第三个返回值如果此服务器认为它是
+// Leader，则为 true。
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -232,16 +253,96 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+// ticker 函数是 Raft 节点的核心驱动循环，在后台 goroutine 中持续运行。
+// 它的主要职责是根据节点的当前状态（Follower, Candidate, Leader）来驱动周期性事件，
+// 例如发起选举。
+//
+// 当节点是 Follower 或 Candidate 时，ticker 充当选举计时器。它会等待一个随机
+// 的选举超时时间。如果在此期间计时器没有被重置（例如，通过收到领导者的有效心跳
+// 或投票给其他候选人），它就会发起一次新的领导者选举。随机化的超时时间对于
+// 减少选举中出现“分裂投票”（split votes）的情况至关重要。
+//
+// 这个循环会通过调用 rf.killed() 方法来检查是否应该退出，确保 goroutine 能够被干净地终止。
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
+	for !rf.killed() {
 
 		// Your code here (3A)
 		// Check if a leader election should be started.
 
-		// pause for a random amount of time between 50 and 350
-		// milliseconds.
-		ms := 50 + (rand.Int63() % 300)
-		time.Sleep(time.Duration(ms) * time.Millisecond)
+		switch rf.state {
+		case Follower, Candidate:
+			// 现有逻辑：检查选举超时并发起选举
+			if time.Since(rf.lastContact) > rf.electionTimeout {
+				rf.startElection()
+			}
+			// 等待一个随机时间
+			ms := 50 + (rand.Int63() % 300)
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+
+		case Leader:
+			// 作为 Leader，周期性地发送心跳/日志
+			rf.broadcastAppendEntries()
+
+			// 睡一个固定的心跳间隔
+			heartbeatInterval := 100 * time.Millisecond
+			time.Sleep(heartbeatInterval)
+		}
+	}
+}
+
+func (rf *Raft) startElection() {
+	rf.currentTerm++
+	rf.state = Candidate
+	rf.votedFor = rf.me
+	rf.lastContact = time.Now()
+
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateId:  rf.me,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].term,
+	}
+
+	votes := 1
+	for i := range rf.peers {
+		if i == rf.me {
+			continue
+		}
+		go func(server int) {
+			reply := RequestVoteReply{}
+			ok := rf.sendRequestVote(i, &args, &reply)
+
+			if !ok {
+				DPrintf("Node %d failed to send RequestVote to %d\n", rf.me, server)
+				return
+			}
+
+			if reply.Term < rf.currentTerm {
+				return
+			}
+
+			if reply.Term > rf.currentTerm {
+				rf.state = Follower
+				rf.currentTerm = reply.Term
+				rf.votedFor = -1
+				rf.lastContact = time.Now()
+				return
+			}
+
+			if reply.VoteGranted {
+				votes++
+				if votes >= len(rf.peers)/2+1 {
+					rf.state = Leader
+					rf.lastContact = time.Now()
+					rf.votedFor = -1
+
+					for j := 0; j < len(rf.peers); j++ {
+						rf.nextIndex[j] = len(rf.log) // Next entry to send to that server
+						rf.matchIndex[j] = 0          // Highest log entry known to be replicated
+					}
+				}
+			}
+		}(i)
 	}
 }
 
@@ -254,6 +355,16 @@ func (rf *Raft) ticker() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
+//
+// Make 函数创建并初始化一个新的 Raft 服务器实例。
+//
+// peers 参数包含了集群中所有 Raft 服务器（包括当前服务器）的 RPC 端点。
+// me 是当前服务器在 peers 切片中的索引。
+// persister 用于保存服务器的持久化状态，并且在启动时也可能持有最近保存的状态。
+// applyCh 是一个通道，Raft 实例通过它向其上层服务（或测试器）发送已提交的日志条目（封装为 ApplyMsg）。
+//
+// Make 函数必须迅速返回，因此任何长时间运行的工作（例如选举和心跳）都应该在独立的 goroutine 中启动。
+// 函数会进行必要的初始化，包括从 persister 中恢复之前持久化的状态，并启动一个 ticker goroutine 来定期发起领导者选举。
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{}
@@ -264,37 +375,17 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (3A, 3B, 3C).
 	// TODO: 初始化raft状态
 	rf.currentTerm = 0
-	rf.log = make([]Log, 0)
+	rf.log = make([]Log, 1)
 
-	// TODO: 创建一个后台 goroutine，当它一段时间没有收到其他对等体的消息时，它将通过发送 `RequestVote` RPC 定期启动领导者选举
-	go func() {
-		var lastLogIndex int
-		var lastLogTerm int
+	rf.commitIndex = 0
+	rf.lastApplied = 0
 
-		if len(rf.log) == 0 {
-			lastLogIndex = 0 // Raft 论文中空日志的索引为 0
-			lastLogTerm = 0  // Raft 论文中空日志的任期为 0
-		} else {
-			lastLogIndex = len(rf.log)
-			lastLogTerm = rf.log[len(rf.log)-1].term
-		}
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 
-		args := RequestVoteArgs{
-			Term:         rf.currentTerm,
-			CandidateId:  me,
-			LastLogIndex: lastLogIndex,
-			LastLogTerm:  lastLogTerm,
-		}
-
-		var reply RequestVoteReply
-
-		for i := range peers {
-			if i == me {
-				continue
-			}
-			rf.sendRequestVote(i, &args, &reply)
-		}
-	}()
+	rf.state = Follower
+	rf.lastContact = time.Now()
+	rf.electionTimeout = time.Duration(150 + (rand.Int63() % 150))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -321,10 +412,17 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Term = rf.currentTerm
+	rf.lastContact = time.Now()
 
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.state = Follower
+		rf.votedFor = -1
 	}
 
 	if args.PrevLogIndex >= len(rf.log) {
@@ -332,16 +430,67 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if rf.log[args.PrevLogIndex].term != args.Term {
+	if rf.log[args.PrevLogIndex].term != args.PrevLogTerm {
 		reply.Success = false
+		rf.log = rf.log[0:args.PrevLogIndex]
 		return
 	}
 
-	rf.commitIndex = args.LeaderCommit
+	rf.log = append(rf.log[0:args.PrevLogIndex+1], args.Entries...)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
+	}
 	reply.Success = true
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
+}
+
+func (rf *Raft) broadcastAppendEntries() {
+	for i := range rf.peers {
+		if i == rf.me {
+			continue // 跳过自己
+		}
+
+		go rf.replicateToPeer(i)
+	}
+}
+
+func (rf *Raft) replicateToPeer(peerIndex int) {
+	prevLogIndex := rf.nextIndex[peerIndex] - 1
+	prevLogTerm := rf.log[prevLogIndex].term
+	entries := make([]Log, len(rf.log[prevLogIndex+1:]))
+	copy(entries, rf.log[prevLogIndex+1:])
+
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+
+	reply := AppendEntriesReply{}
+	ok := rf.sendAppendEntries(peerIndex, &args, &reply)
+	if !ok {
+		return
+	}
+
+	if reply.Success {
+		rf.matchIndex[peerIndex] = args.PrevLogIndex + len(args.Entries)
+		rf.nextIndex[peerIndex] = rf.matchIndex[peerIndex] + 1
+	} else {
+		if reply.Term > rf.currentTerm {
+			rf.state = Follower
+			rf.currentTerm = reply.Term
+			rf.votedFor = -1
+		} else {
+			// 日志不一致，后退 nextIndex 并重试
+			// 为了防止快速失败导致的大量 RPC，可以实现更优化的后退策略
+			rf.nextIndex[peerIndex]--
+		}
+	}
 }
