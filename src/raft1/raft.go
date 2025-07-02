@@ -7,14 +7,14 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
+	// 	"bytes"
 
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	// 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -23,10 +23,12 @@ import (
 // --- 数据类型定义 ---
 
 const (
-	// 选举超时的基准时间 (例如 300ms)
+	// 选举超时的基准时间 (例如 400ms)
 	electionTimeoutBase = 400 * time.Millisecond
 	// 心跳间隔 (必须远小于选举超时时间, 例如 120ms)
 	heartbeatInterval = 120 * time.Millisecond
+	// Ticker 循环的轮询间隔，用于检查状态
+	tickInterval = 20 * time.Millisecond
 )
 
 // Raft 节点有三种状态: Follower, Candidate, Leader
@@ -68,16 +70,11 @@ type Raft struct {
 	me    int                 // 当前节点在 peers 数组中的索引/ID
 	peers []*labrpc.ClientEnd // 所有对等节点的 RPC 客户端连接
 
-	// 选举计时器. 当这个计时器触发时, Follower 会转变为 Candidate 并开始选举
-	electionTimer *time.Timer
+	// --- 【重构】使用 time.Sleep 的核心字段 ---
+	// 替代 electionTimer，记录下一次选举超时的时间点
+	electionDeadline time.Time
 
-	// 心跳计时器. Leader 用它来定期发送心跳
-	heartbeatTimer *time.Timer
-
-	// 当选举成功或收到有效心跳时，通过这个 channel 来重置选举计时器
-	resetElectionTimerCh chan struct{}
-
-	// RPC 请求和回复的 channels
+	// RPC 请求和回复的 channels (如果使用，保留)
 	requestVoteCh   chan RequestVoteArgs
 	appendEntriesCh chan AppendEntriesArgs
 
@@ -120,28 +117,9 @@ type AppendEntriesReply struct {
 
 // --- 接口 ---
 
-// the service or tester wants to create a Raft server. the ports
-// of all the Raft servers (including this one) are in peers[]. this
-// server's port is peers[me]. all the servers' peers[] arrays
-// have the same order. persister is a place for this server to
-// save its persistent state, and also initially holds the most
-// recent saved state, if any. applyCh is a channel on which the
-// tester or service expects Raft to send ApplyMsg messages.
-// Make() must return quickly, so it should start goroutines
-// for any long-running work.
-//
 // Make 函数创建并初始化一个新的 Raft 服务器实例。
-//
-// peers 参数包含了集群中所有 Raft 服务器（包括当前服务器）的 RPC 端点。
-// me 是当前服务器在 peers 切片中的索引。
-// persister 用于保存服务器的持久化状态，并且在启动时也可能持有最近保存的状态。
-// applyCh 是一个通道，Raft 实例通过它向其上层服务（或测试器）发送已提交的日志条目（封装为 ApplyMsg）。
-//
-// Make 函数必须迅速返回，因此任何长时间运行的工作（例如选举和心跳）都应该在独立的 goroutine 中启动。
-// 函数会进行必要的初始化，包括从 persister 中恢复之前持久化的状态，并启动一个 ticker goroutine 来定期发起领导者选举。
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
-	// Your initialization code here (3A, 3B, 3C).
 	rf := &Raft{
 		peers:       peers,
 		persister:   persister,
@@ -158,35 +136,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	// 【重构】初始化选举超时时间点
+	rf.resetElectionTimerLocked()
+
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	DPrintf("raft 端点 %d 创建成功", me)
 
 	return rf
 }
 
-// the service using Raft (e.g. a k/v server) wants to start
-// agreement on the next command to be appended to Raft's log. if this
-// server isn't the leader, returns false. otherwise start the
-// agreement and return immediately. there is no guarantee that this
-// command will ever be committed to the Raft log, since the leader
-// may fail or lose an election. even if the Raft instance has been killed,
-// this function should return gracefully.
-//
-// the first return value is the index that the command will appear at
-// if it's ever committed. the second return value is the current
-// term. the third return value is true if this server believes it is
-// the leader.
-//
-// 使用 Raft 的服务（例如键/值服务器）希望就要附加到 Raft 日志的下一个命令启动一致性协议。
-// 如果当前服务器不是 Leader，则返回 false。
-// 否则，立即启动一致性协议并返回。
-// 不保证此命令最终会提交到 Raft 日志，因为 Leader
-// 可能会失败或在选举中失利。
-// 即使 Raft 实例已被终止，此函数也应优雅地返回。
-//
-// 第一个返回值是如果命令最终被提交，它将出现的日志索引。
-// 第二个返回值是当前任期。第三个返回值如果此服务器认为它是
-// Leader，则为 true。
+// Start 尝试将 command 作为下一个日志条目进行共识。
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -197,8 +158,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-// return currentTerm and whether this server
-// believes it is the leader.
+// GetState 返回当前任期和节点是否是 Leader。
 func (rf *Raft) GetState() (int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -210,7 +170,6 @@ func (rf *Raft) GetState() (int, bool) {
 // --- RPC 调用 ---
 
 // RequestVote RPC handler.
-// 这个方法必须符合 rpc.Register 的格式要求。
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -228,19 +187,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 
 	// 规则 2: 投票资格检查
-	// a) 当前节点尚未在本任期内投票 (rf.votedFor == -1)
-	// b) 或者已经投给了该候选人 (rf.votedFor == args.CandidateID)
-	// 并且 c) 候选人的日志至少和自己一样新 (isLogUpToDate 检查)
 	canVote := rf.votedFor == -1 || rf.votedFor == args.CandidateID
 	logIsUpToDate := true // 在只实现选举时，暂时假设日志总是最新的
-	// logIsUpToDate := isLogUpToDate(args.LastLogTerm, args.LastLogIndex, rf.getLastLogTerm(), rf.getLastLogIndex())
 
 	if canVote && logIsUpToDate {
 		// 同意投票
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateID // 记录下投给了谁
-		// **关键**：同意投票后，重置自己的选举计时器，因为候选人有潜力成为 Leader
-		rf.electionTimer.Reset(randomizedElectionTimeout())
+		// **关键**：同意投票后，重置自己的选举计时器
+		// 【重构】调用新的计时器重置函数
+		rf.resetElectionTimerLocked()
 	} else {
 		reply.VoteGranted = false
 	}
@@ -254,91 +210,32 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 规则 1: 如果 Leader 的任期(args.Term)小于当前任期(rf.currentTerm)，
-	// 这是一个过时的 Leader，拒绝它的请求。
+	// 规则 1: 如果 Leader 的任期(args.Term)小于当前任期(rf.currentTerm)，拒绝。
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
-	// **关键逻辑**：
-	// 无论当前节点是什么状态（Follower, Candidate, 甚至是另一个任期较低的 Leader），
 	// 只要收到一个任期不低于自己的 Leader 的心跳，就必须无条件转为 Follower。
-	// 这确保了集群中任一时刻只有一个 Leader。
-	rf.becomeFollower(args.Term)
+	rf.becomeFollowerLocked(args.Term)
 
-	// **重要**：收到有效心跳，说明 Leader 还在，重置选举计时器，推迟下一轮选举。
-	rf.electionTimer.Reset(randomizedElectionTimeout())
+	// **重要**：收到有效心跳，重置选举计时器。
+	rf.resetElectionTimerLocked()
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
-	// (未来日志复制的逻辑会在这里添加...)
-
 	return
 }
 
-// example code to send a RequestVote RPC to a server.
-// server is the index of the target server in rf.peers[].
-// expects RPC arguments in args.
-// fills in *reply with RPC reply, so caller should
-// pass &reply.
-// the types of the args and reply passed to Call() must be
-// the same as the types of the arguments declared in the
-// handler function (including whether they are pointers).
-//
-// The labrpc package simulates a lossy network, in which servers
-// may be unreachable, and in which requests and replies may be lost.
-// Call() sends a request and waits for a reply. If a reply arrives
-// within a timeout interval, Call() returns true; otherwise
-// Call() returns false. Thus Call() may not return for a while.
-// A false return can be caused by a dead server, a live server that
-// can't be reached, a lost request, or a lost reply.
-//
-// Call() is guaranteed to return (perhaps after a delay) *except* if the
-// handler function on the server side does not return.  Thus there
-// is no need to implement your own timeouts around Call().
-//
-// look at the comments in ../labrpc/labrpc.go for more details.
-//
-// if you're having trouble getting RPC to work, check that you've
-// capitalized all field names in structs passed over RPC, and
-// that the caller passes the address of the reply struct with &, not
-// the struct itself.
-//
-// 示例代码，向服务器发送 RequestVote RPC。
-// server 是目标服务器在 rf.peers[] 中的索引。
-// RPC 参数预期在 args 中。
-// *reply 中填充 RPC 回复，因此调用者应
-// 传入 &reply。
-// 传递给 Call() 的 args 和 reply 参数的类型必须
-// 与处理函数中声明的参数类型完全一致
-// （包括它们是否为指针）。
-//
-// labrpc 包模拟了一个有损网络，其中服务器
-// 可能无法访问，并且请求和回复可能丢失。
-// Call() 发送一个请求并等待回复。如果回复在
-// 超时时间内到达，Call() 返回 true；否则
-// Call() 返回 false。因此 Call() 可能会等待一段时间才返回。
-// 返回 false 的原因可能是服务器宕机、无法访问的活动服务器、
-// 请求丢失或回复丢失。
-//
-// Call() 保证会返回（可能会有延迟），*除非*
-// 服务器端的处理函数没有返回。因此，
-// 无需在 Call() 周围实现您自己的超时机制。
-//
-// 有关更多详细信息，请查阅 ../labrpc/labrpc.go 中的注释。
-//
-// 如果您在使 RPC 工作时遇到问题，请检查您是否
-// 将通过 RPC 传递的结构体中的所有字段名都大写了，并且
-// 调用者传递的是回复结构体的地址（带 &），而不是
-// 结构体本身。
+// sendRequestVote 发送投票请求
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
+// sendAppendEntries 发送心跳或日志
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
@@ -346,93 +243,85 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 // --- 实现 ---
 
-// ticker 函数是 Raft 节点的核心驱动循环，在后台 goroutine 中持续运行。
-// 它的主要职责是根据节点的当前状态（Follower, Candidate, Leader）来驱动周期性事件，
-// 例如发起选举。
-//
-// 当节点是 Follower 或 Candidate 时，ticker 充当选举计时器。它会等待一个随机
-// 的选举超时时间。如果在此期间计时器没有被重置（例如，通过收到领导者的有效心跳
-// 或投票给其他候选人），它就会发起一次新的领导者选举。随机化的超时时间对于
-// 减少选举中出现“分裂投票”（split votes）的情况至关重要。
-//
-// 这个循环会通过调用 rf.killed() 方法来检查是否应该退出，确保 goroutine 能够被干净地终止。
+// 【重构】ticker 函数现在是一个统一的驱动循环。
+// 它不再使用 select 和 time.Timer channel，而是定期（由 tickInterval 定义）
+// 醒来，并根据当前节点的状态和时间条件来决定是否需要执行操作
+// （发起选举或发送心跳）。
 func (rf *Raft) ticker() {
-	// 初始化计时器
-	rf.electionTimer = time.NewTimer(randomizedElectionTimeout())
-	rf.heartbeatTimer = time.NewTimer(heartbeatInterval)
-	// 领导者一开始不发送心跳，所以先停止心跳计时器
-	rf.heartbeatTimer.Stop()
-
-	// Your code here (3A)
-	// Check if a leader election should be started.
 	for !rf.killed() {
-		select {
-		case <-rf.electionTimer.C:
-			rf.mu.Lock()
-			// 在成为 Candidate 之前，再次确认自己还是 Follower 或 Candidate
-			if rf.state == Follower || rf.state == Candidate {
-				// becomeCandidate 内部会处理加锁，所以这里可以先解锁
-				rf.mu.Unlock()
-				rf.becomeCandidate()
-			} else {
-				// 如果已经成为了 Leader，就什么都不做
-				rf.mu.Unlock()
-			}
+		// 每次循环都短暂休眠，形成轮询
+		time.Sleep(tickInterval)
 
-		case <-rf.heartbeatTimer.C:
-			rf.mu.Lock()
-			// 确保自己仍然是 Leader
-			if rf.state == Leader {
-				// sendHeartbeats 内部会处理锁，所以先解锁
-				rf.mu.Unlock()
-				rf.sendHeartbeats()
-				// 重置计时器也应该在锁外进行
-				rf.heartbeatTimer.Reset(heartbeatInterval)
-			} else {
-				rf.mu.Unlock()
+		rf.mu.Lock()
+		// 根据当前状态执行不同的逻辑
+		switch rf.state {
+		case Follower, Candidate:
+			// 检查选举是否超时
+			if time.Now().After(rf.electionDeadline) {
+				// 选举超时，立即开始新的选举
+				rf.becomeCandidateLocked()
 			}
+		case Leader:
+			// Leader 不需要检查选举超时，它负责发送心跳。
+			// 这个逻辑被移到 `leaderHeartbeatLoop` 中，以简化 ticker。
+			// 这里什么都不做，让 Leader 的专用 goroutine 处理心跳。
 		}
+		rf.mu.Unlock()
 	}
 }
 
-// randomizedElectionTimeout 生成一个随机的选举超时时间
-// 这对于防止多个节点同时超时、同时发起选举（导致投票分裂）至关重要
+// 【重构】为 Leader 状态创建一个专门的、清晰的循环来发送心跳。
+// 这个 goroutine 在节点成为 Leader 时启动，并在其不再是 Leader 时退出。
+func (rf *Raft) leaderHeartbeatLoop() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		// 如果不再是 Leader，此循环的使命结束
+		if rf.state != Leader {
+			rf.mu.Unlock()
+			return
+		}
+		// 持有锁，立即发送一轮心跳（sendHeartbeats内部会解锁）
+		rf.sendHeartbeatsLocked()
+		rf.mu.Unlock()
+
+		// 等待一个心跳间隔
+		time.Sleep(heartbeatInterval)
+	}
+}
+
+// 【重构】生成一个随机的选举超时时间
 func randomizedElectionTimeout() time.Duration {
-	// 例如，在 [300ms, 450ms] 之间选择一个随机值
 	return electionTimeoutBase + time.Duration(rand.Intn(150))*time.Millisecond
 }
 
-// becomeFollower 切换节点状态为 Follower (对外暴露的接口)
-// 这个函数会先获取锁，然后调用内部的非锁版本
-func (rf *Raft) becomeFollower(term int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	rf.becomeFollowerLocked(term) // 调用内部函数
+// 【重构】这是一个新的辅助函数，用于重置选举超时时间点。
+// 它取代了之前对 `electionTimer.Reset()` 的调用。
+// "Locked" 后缀表示此函数期望在调用时已经持有锁。
+func (rf *Raft) resetElectionTimerLocked() {
+	rf.electionDeadline = time.Now().Add(randomizedElectionTimeout())
 }
 
-// becomeFollowerLocked 是实际的状态转换逻辑，它假设调用者已经持有锁。
-// 函数名后缀 "Locked" 是一种常见的约定。
+// becomeFollowerLocked 是实际的状态转换逻辑，假设调用者已持有锁。
 func (rf *Raft) becomeFollowerLocked(term int) {
 	rf.state = Follower
 	rf.currentTerm = term
 	rf.votedFor = -1
-
-	rf.electionTimer.Reset(randomizedElectionTimeout())
-	rf.heartbeatTimer.Stop()
+	// 【重构】重置选举超时时间点
+	rf.resetElectionTimerLocked()
 }
 
-// becomeCandidate 切换节点状态为 Candidate 并开始选举
-func (rf *Raft) becomeCandidate() {
-	rf.mu.Lock()
-
+// 【重构】`becomeCandidate` 现在是一个内部函数 `becomeCandidateLocked`。
+// 它假设调用时已持有锁，并负责状态转换和发起并发的投票请求。
+// ticker 循环会在选举超时后调用它。
+func (rf *Raft) becomeCandidateLocked() {
 	rf.state = Candidate
 	rf.currentTerm++    // 任期加1
 	rf.votedFor = rf.me // 给自己投票
 
-	// 重置选举计时器，为新一轮选举计时
-	rf.electionTimer.Reset(randomizedElectionTimeout())
+	// 重置下一次的选举计时器
+	rf.resetElectionTimerLocked()
 
-	// log.Printf("Node %d became Candidate, starting election for term %d", rf.me, rf.currentTerm)
+	DPrintf("Node %d became Candidate, starting election for term %d", rf.me, rf.currentTerm)
 
 	// 准备 RequestVote RPC 的参数
 	args := RequestVoteArgs{
@@ -440,10 +329,10 @@ func (rf *Raft) becomeCandidate() {
 		CandidateID: rf.me,
 		// ... LastLogTerm 和 LastLogIndex 字段
 	}
-	rf.mu.Unlock() // 在发送 RPC 前解锁，避免阻塞
 
 	// 为自己获得一票
-	votesGranted := 1
+	// 使用原子变量，因为它会被多个 goroutine 并发地增加
+	var votesGranted int32 = 1
 
 	// 并发地向所有其他节点发送投票请求
 	for i := range rf.peers {
@@ -453,11 +342,9 @@ func (rf *Raft) becomeCandidate() {
 
 		go func(serverIndex int) {
 			reply := RequestVoteReply{}
-			// `sendRequestVote` 是你封装的 RPC 调用函数
 			ok := rf.sendRequestVote(serverIndex, &args, &reply)
-
 			if !ok {
-				return // RPC 失败，直接返回
+				return
 			}
 
 			rf.mu.Lock()
@@ -469,20 +356,18 @@ func (rf *Raft) becomeCandidate() {
 				return
 			}
 
-			// 检查是否还在当前的选举状态（任期和角色都没变）
+			// 检查我们是否还在当初发起选举时的状态
 			if rf.state != Candidate || rf.currentTerm != args.Term {
 				return
 			}
 
 			if reply.VoteGranted {
-				votesGranted++
-				// 如果获得超过半数的选票，立即成为 Leader
-				if votesGranted > len(rf.peers)/2 {
-					// **关键**：只在还是 Candidate 时才转换
+				atomic.AddInt32(&votesGranted, 1)
+				// 检查是否获得超过半数的选票
+				if atomic.LoadInt32(&votesGranted) > int32(len(rf.peers)/2) {
+					// **关键**：只在还是 Candidate 时才转换，避免重复转换
 					if rf.state == Candidate {
-						// becomeLeader 内部不再调用 sendHeartbeats
-						// 而是由 ticker 驱动
-						rf.becomeLeader()
+						rf.becomeLeaderLocked()
 					}
 				}
 			}
@@ -490,73 +375,49 @@ func (rf *Raft) becomeCandidate() {
 	}
 }
 
-// becomeLeader 切换节点状态为 Leader
-func (rf *Raft) becomeLeader() {
-	// 调用此函数时，必须已经持有锁
+// 【重构】`becomeLeader` 改为 `becomeLeaderLocked`，假设已持有锁。
+func (rf *Raft) becomeLeaderLocked() {
+	// 调用此函数时，必须已经持有锁且状态为 Candidate
 	if rf.state != Candidate {
-		// 可能在等待投票期间，已经收到了新 leader 的心跳，变成了 follower
-		// 此时不应该再成为 leader
 		return
 	}
 
 	rf.state = Leader
-	// log.Printf("Node %d became Leader for term %d!", rf.me, rf.currentTerm)
+	DPrintf("Node %d became Leader for term %d!", rf.me, rf.currentTerm)
 
-	// (3B) 成为 Leader 后，需要初始化 nextIndex 和 matchIndex
-	// rf.nextIndex = make([]int, len(rf.peers))
-	// lastLogIndex := rf.getLastLogIndex()
-	// for i := range rf.peers {
-	//     rf.nextIndex[i] = lastLogIndex + 1
-	// }
-	// rf.matchIndex = make([]int, len(rf.peers))
+	// (3B) 成为 Leader 后，需要初始化 nextIndex 和 matchIndex ...
 
-	// 成为 Leader 后，停止选举计时器
-	rf.electionTimer.Stop()
-
-	// **关键修改**：不要在这里直接调用 sendHeartbeats()。
-	// 而是立即发送一轮心跳，然后让 ticker 来周期性地发送。
-	// 为了立即发送，我们可以手动重置心跳计时器让它马上触发，或者直接调用。
-	// 更清晰的做法是，让 ticker 负责所有周期性事件。
-	// 我们在这里立刻发送第一轮心跳，然后重置计时器。
-	// 注意：sendHeartbeats 必须在锁外调用！
-	go rf.sendHeartbeats()                     // 启动一个 goroutine 来发送初始心跳
-	rf.heartbeatTimer.Reset(heartbeatInterval) // 重置心跳计时器以维持领导
+	// 【重构】成为 Leader 后，启动一个专用的 goroutine 来周期性地发送心跳。
+	// 这取代了之前对心跳计时器的操作。
+	go rf.leaderHeartbeatLoop()
 }
 
-// sendHeartbeats 向所有 Follower 发送心跳
-func (rf *Raft) sendHeartbeats() {
-	rf.mu.Lock()
-	// 如果在我们准备发送心跳时，状态已经不是 Leader 了，就直接返回
-	if rf.state != Leader {
-		rf.mu.Unlock()
-		return
-	}
-	// log.Printf("Leader %d sending heartbeats for term %d", rf.me, rf.currentTerm)
+// 【重构】`sendHeartbeats` 改为 `sendHeartbeatsLocked`。
+// 它在 `leaderHeartbeatLoop` 中被调用，调用时已持有锁。
+// 它会立即广播心跳。
+func (rf *Raft) sendHeartbeatsLocked() {
+	DPrintf("Leader %d sending heartbeats for term %d", rf.me, rf.currentTerm)
 	args := AppendEntriesArgs{
 		Term:     rf.currentTerm,
 		LeaderID: rf.me,
 	}
-	rf.mu.Unlock() // **在 RPC 调用前释放锁！**
 
 	for i := range rf.peers {
 		if i == rf.me {
 			continue
 		}
-		go func(serverIndex int) {
+		go func(serverIndex int, args AppendEntriesArgs) {
 			reply := AppendEntriesReply{}
-			// 复制一份参数，以防万一
-			localArgs := args
-			ok := rf.sendAppendEntries(serverIndex, &localArgs, &reply)
+			ok := rf.sendAppendEntries(serverIndex, &args, &reply)
 			if ok {
-				// 处理回复 (现在可以忽略，但之后很重要)
 				rf.mu.Lock()
-				// 检查收到的任期，如果发现更大的任期，自己需要退位
+				// 如果发现更大的任期，自己需要退位
 				if reply.Term > rf.currentTerm {
 					rf.becomeFollowerLocked(reply.Term)
 				}
 				rf.mu.Unlock()
 			}
-		}(i)
+		}(i, args)
 	}
 }
 
