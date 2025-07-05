@@ -27,6 +27,14 @@ type Raft interface {
 // In Lab 3 you'll want to send other kinds of messages (e.g.,
 // snapshots) on the applyCh; at that point you can add fields to
 // ApplyMsg, but set CommandValid to false for these other uses.
+//
+// 当每个 Raft 对等节点（peer）得知日志条目（log entries）被相继提交（committed）后，
+// 该节点应通过传递给 Make() 函数的 applyCh 通道（channel），
+// 向服务器（或测试程序）发送一个 ApplyMsg 消息。
+// 将 CommandValid 设置为 true，以表明该 ApplyMsg 包含一条新提交的日志条目。
+//
+// 在实验 3 中，你会希望在 applyCh 上发送其他类型的消息（例如，快照）。
+// 到那时，你可以向 ApplyMsg 添加新的字段，但对于这些其他用途，请将 CommandValid 设置为 false。
 type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}

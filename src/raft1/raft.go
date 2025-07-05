@@ -96,7 +96,7 @@ type RequestVoteArgs struct {
 	LastLogTerm  int // 候选人最后日志条目的任期号
 }
 
-// RequestVoteReply 是 RequestVote RPC 的回复结构体
+// RequestVoteReply 是 RequestVote RPC 的回`复结构体
 type RequestVoteReply struct {
 	Term        int  // 当前任期号，以便于候选人更新自己的任期
 	VoteGranted bool // 候选人赢得了此张选票时为真
@@ -106,7 +106,9 @@ type RequestVoteReply struct {
 type AppendEntriesArgs struct {
 	Term     int
 	LeaderID int
-	// ... (日志复制相关字段暂时忽略)
+	// 日志复制相关字段暂时忽略
+	Entries      []LogEntry
+	LeaderCommit int
 }
 
 // AppendEntriesReply 是 AppendEntries RPC 的回复结构体
@@ -117,7 +119,24 @@ type AppendEntriesReply struct {
 
 // --- 接口 ---
 
-// Make 函数创建并初始化一个新的 Raft 服务器实例。
+// the service or tester wants to create a Raft server. the ports
+// of all the Raft servers (including this one) are in peers[]. this
+// server's port is peers[me]. all the servers' peers[] arrays
+// have the same order. persister is a place for this server to
+// save its persistent state, and also initially holds the most
+// recent saved state, if any. applyCh is a channel on which the
+// tester or service expects Raft to send ApplyMsg messages.
+// Make() must return quickly, so it should start goroutines
+// for any long-running work.
+//
+// 服务或测试器希望创建一个Raft服务器。
+// 所有Raft服务器（包括此服务器）的端口都在peers[]中。
+// 此服务器的端口是peers[me]。
+// 所有服务器的peers[]数组都具有相同的顺序。
+// persister是此服务器保存其持久状态的地方，
+// 并且最初也持有任何最近保存的状态。
+// applyCh是一个通道，测试器或服务期望Raft在此通道上发送ApplyMsg消息。
+// Make()必须快速返回，因此它应该为任何长时间运行的工作启动goroutine。
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	rf := &Raft{
@@ -147,7 +166,27 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
-// Start 尝试将 command 作为下一个日志条目进行共识。
+// the service using Raft (e.g. a k/v server) wants to start
+// agreement on the next command to be appended to Raft's log. if this
+// server isn't the leader, returns false. otherwise start the
+// agreement and return immediately. there is no guarantee that this
+// command will ever be committed to the Raft log, since the leader
+// may fail or lose an election. even if the Raft instance has been killed,
+// this function should return gracefully.
+//
+// the first return value is the index that the command will appear at
+// if it's ever committed. the second return value is the current
+// term. the third return value is true if this server believes it is
+// the leader.
+//
+// 使用 Raft 的服务（例如，一个键/值服务器）想要就下一条将要附加到 Raft 日志的命令达成共识。
+// 如果此服务器不是领导者（leader），则返回 false。否则，启动共识过程并立即返回。
+// 并不保证此命令最终一定会被提交（committed）到 Raft 日志中，因为领导者可能会宕机或在选举中落败。
+// 即使 Raft 实例已经被终止，此函数也应该能正常地返回。
+//
+// 第一个返回值是该命令如果被成功提交后，将会出现在日志中的索引（index）。
+// 第二个返回值是当前的任期号（term）。
+// 第三个返回值标识此服务器是否认为自己是领导者（leader），如果是则为 true。
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -155,13 +194,83 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (3B).
 
+	// 在整个函数执行期间上锁
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// 检查是否为领导者
+	term, isLeader = rf.GetStateLocked()
+	if !isLeader {
+		return index, term, isLeader
+	}
+
+	log := LogEntry{
+		Term:    term,
+		Command: command,
+	}
+
+	// 将命令附加到下一条日志
+	// DPrintf("将命令 %v 附加到日志", command)
+
+	// -- 附加到本节点日志
+	index = len(rf.log)
+	rf.log = append(rf.log, log)
+
+	var logApplied int32 = 1
+
+	// -- 请求其他节点附加命令
+	for i := range rf.peers {
+		// 跳过自己
+		if i == rf.me {
+			continue
+		}
+
+		go func(i int) {
+			args := AppendEntriesArgs{
+				Term:     term,
+				LeaderID: rf.me,
+				Entries:  []LogEntry{log},
+			}
+
+			var reply AppendEntriesReply
+
+			ok := rf.sendAppendEntries(i, &args, &reply)
+
+			if !ok || !reply.Success {
+				DPrintf("测试 3A 中假定不会有网络错误, rpc请求也一定能成功")
+				panic("测试 3A 中假定不会有网络错误, rpc请求也一定能成功")
+			}
+
+			if reply.Success {
+				atomic.AddInt32(&logApplied, 1)
+				// 检查是否超过半数节点已经将命令附加到日志
+				if atomic.LoadInt32(&logApplied) > int32(len(rf.peers)/2) {
+					rf.commitIndex = index
+					rf.applyCh <- raftapi.ApplyMsg{
+						CommandValid: true,
+						Command:      command,
+						CommandIndex: index,
+					}
+				}
+			}
+
+			rf.currentTerm = reply.Term
+		}(i)
+	}
+
 	return index, term, isLeader
 }
 
-// GetState 返回当前任期和节点是否是 Leader。
+// return currentTerm and whether this server
+// believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
+	// Your code here (3A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	return rf.GetStateLocked()
+}
+
+func (rf *Raft) GetStateLocked() (int, bool) {
 	term := rf.currentTerm
 	isleader := (rf.state == Leader)
 	return term, isleader
@@ -169,7 +278,6 @@ func (rf *Raft) GetState() (int, bool) {
 
 // --- RPC 调用 ---
 
-// RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -206,6 +314,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 // AppendEntries RPC handler.
+// Invoked by leader to replicate log entries; also used as heartbeat.
+//
+//	如果请求的 term（任期）小于当前服务器的 currentTerm，则回复 false (§5.1)
+//	如果日志在 prevLogIndex 位置的条目任期与 prevLogTerm 不匹配，则回复 false (§5.3)
+//	如果一个已存在的条目与新的条目发生冲突（相同的索引，但任期不同），则删除这个已存在的条目以及其后所有的条目 (§5.3)
+//	附加所有日志中不存在的新条目
+//	如果领导者的 leaderCommit 大于接收者的 commitIndex，则将 commitIndex 设置为 min(leaderCommit, 最后一条新条目的索引)
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -220,13 +335,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 只要收到一个任期不低于自己的 Leader 的心跳，就必须无条件转为 Follower。
 	rf.becomeFollowerLocked(args.Term)
 
-	// **重要**：收到有效心跳，重置选举计时器。
+	// 收到有效心跳，重置选举计时器。
 	rf.resetElectionTimerLocked()
+
+	// 检查 leader 是否提交了新的日志
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = args.LeaderCommit
+		rf.applyCh <- raftapi.ApplyMsg{
+			CommandValid: true,
+			Command:      rf.log[rf.commitIndex].Command,
+			CommandIndex: rf.commitIndex,
+		}
+	}
+
+	if len(args.Entries) > 0 {
+		// 将新日志附加到本节点日志中
+		rf.log = append(rf.log, args.Entries...)
+		DPrintf("raft %d received append entries rpc successfully in term %d.", rf.me, rf.currentTerm)
+	}
 
 	reply.Term = rf.currentTerm
 	reply.Success = true
-
-	return
 }
 
 // sendRequestVote 发送投票请求
@@ -237,6 +366,7 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 
 // sendAppendEntries 发送心跳或日志
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	// DPrintf("raft %d send AppendEntries to %d", args.LeaderID, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -396,10 +526,11 @@ func (rf *Raft) becomeLeaderLocked() {
 // 它在 `leaderHeartbeatLoop` 中被调用，调用时已持有锁。
 // 它会立即广播心跳。
 func (rf *Raft) sendHeartbeatsLocked() {
-	DPrintf("Leader %d sending heartbeats for term %d", rf.me, rf.currentTerm)
+	// DPrintf("Leader %d sending heartbeats for term %d", rf.me, rf.currentTerm)
 	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderID: rf.me,
+		Term:         rf.currentTerm,
+		LeaderID:     rf.me,
+		LeaderCommit: rf.commitIndex,
 	}
 
 	for i := range rf.peers {
