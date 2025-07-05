@@ -236,9 +236,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 			ok := rf.sendAppendEntries(i, &args, &reply)
 
-			if !ok || !reply.Success {
-				DPrintf("测试 3A 中假定不会有网络错误, rpc请求也一定能成功")
-				panic("测试 3A 中假定不会有网络错误, rpc请求也一定能成功")
+			if !ok {
+				// panic("测试 3A 中假定不会有网络错误, rpc请求也一定能成功")
+				return
 			}
 
 			if reply.Success {
