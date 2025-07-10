@@ -70,7 +70,7 @@ type Raft struct {
 	me    int                 // 当前节点在 peers 数组中的索引/ID
 	peers []*labrpc.ClientEnd // 所有对等节点的 RPC 客户端连接
 
-	// --- 【重构】使用 time.Sleep 的核心字段 ---
+	// --- 使用 time.Sleep 的核心字段 ---
 	// 替代 electionTimer，记录下一次选举超时的时间点
 	electionDeadline time.Time
 
@@ -113,6 +113,10 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// 添加以下字段用于快速回溯
+	XTerm  int // 冲突条目的任期号 (如果存在)
+	XIndex int // 冲突任期的第一个条目的索引
+	XLen   int // Follower 日志的长度
 }
 
 // --- 接口 ---
@@ -235,7 +239,6 @@ func (rf *Raft) GetStateLocked() (int, bool) {
 }
 
 // --- RPC 调用 ---
-
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -309,9 +312,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 重置选举超时计时器
 	rf.resetElectionTimerLocked()
 
-	logConflict := len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm
+	// --- 【优化】日志冲突处理 ---
 
-	if logConflict {
+	// 检查 PrevLogIndex 是否越界
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.XLen = len(rf.log)
+		reply.XTerm = -1 // 使用表示不存在该日志
+		reply.XIndex = -1
+		return
+	}
+
+	// 检查 PrevLogTerm 是否匹配
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		// 找到任期为 XTerm 的第一个条目的索引
+		firstIndex := args.PrevLogIndex
+		for firstIndex > 0 && rf.log[firstIndex-1].Term == reply.XTerm {
+			firstIndex--
+		}
+		reply.XIndex = firstIndex
+		reply.XLen = len(rf.log)
 		return
 	}
 
@@ -325,16 +345,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	// 检查 leader 是否提交了新的日志
-	for rf.commitIndex <= args.LeaderCommit {
-		if len(rf.log)-1 <= rf.commitIndex {
-			break
+	if args.LeaderCommit > rf.commitIndex {
+		// 计算新的 commitIndex，取 Leader 的 commitIndex 和本地最新日志索引中的较小值
+		newCommitIndex := min(len(rf.log)-1, args.LeaderCommit)
+
+		// 将新提交的日志条目应用到状态机
+		for i := rf.commitIndex + 1; i <= newCommitIndex; i++ {
+			rf.applyCh <- raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
+			}
 		}
-		rf.commitIndex++
-		rf.applyCh <- raftapi.ApplyMsg{
-			CommandValid: true,
-			Command:      rf.log[rf.commitIndex].Command,
-			CommandIndex: rf.commitIndex,
-		}
+
+		// 更新 commitIndex
+		rf.commitIndex = newCommitIndex
 	}
 
 	reply.Success = true
@@ -417,7 +442,7 @@ func (rf *Raft) resetElectionTimerLocked() {
 
 // becomeFollowerLocked 是实际的状态转换逻辑，假设调用者已持有锁。
 func (rf *Raft) becomeFollowerLocked(term int) {
-	DPrintf("Node %d became Follower in term %d", rf.me, rf.currentTerm)
+	// DPrintf("Node %d became Follower in term %d", rf.me, rf.currentTerm)
 	rf.state = Follower
 	rf.currentTerm = term
 	rf.votedFor = -1
@@ -514,7 +539,7 @@ func (rf *Raft) becomeLeaderLocked() {
 // 它在 `leaderHeartbeatLoop` 中被调用，调用时已持有锁。
 // 它会立即广播心跳。
 func (rf *Raft) sendHeartbeatsLocked() {
-	// DPrintf("Leader %d sending heartbeats for term %d", rf.me, rf.currentTerm)
+	DPrintf("Leader %d sending heartbeats for term %d", rf.me, rf.currentTerm)
 
 	// 向所有的 follower 发送心跳或者日志复制 rpc
 	for i := range rf.peers {
@@ -561,9 +586,35 @@ func (rf *Raft) sendHeartbeatsLocked() {
 
 			// -- follower 的日志冲突了
 			if !reply.Success {
-				// 检查是否nextIndex已经被更新
-				if args.PrevLogIndex+1 == rf.nextIndex[i] {
-					rf.nextIndex[i]--
+				// 【优化】使用 Follower 返回的信息进行快速回退
+				if reply.XTerm == -1 {
+					// 情况1: Follower的日志太短，没有PrevLogIndex
+					// 直接将 nextIndex 设置为 Follower 日志的长度
+					rf.nextIndex[i] = reply.XLen
+				} else {
+					// 情况2: 在PrevLogIndex处存在任期冲突
+					lastLogIndexWithXTerm := -1
+					// Leader 在自己的日志中寻找任期为 XTerm 的最后一个条目
+					for j := len(rf.log) - 1; j >= 0; j-- {
+						if rf.log[j].Term == reply.XTerm {
+							lastLogIndexWithXTerm = j
+							break
+						}
+					}
+
+					if lastLogIndexWithXTerm != -1 {
+						// 如果找到了，说明Leader有这个任期的日志
+						// 将 nextIndex 设置为这个任期的最后一个条目的下一位
+						rf.nextIndex[i] = lastLogIndexWithXTerm + 1
+					} else {
+						// 如果没找到，说明Leader没有这个任期的日志
+						// 直接将 nextIndex 设置为Follower报告的、该冲突任期的第一个条目索引
+						rf.nextIndex[i] = reply.XIndex
+					}
+				}
+				// 确保 nextIndex 至少为1
+				if rf.nextIndex[i] < 1 {
+					rf.nextIndex[i] = 1
 				}
 				return
 			}
@@ -584,26 +635,29 @@ func (rf *Raft) sendHeartbeatsLocked() {
 
 // 更新 commitIndex 的逻辑, 假设已持有锁
 func (rf *Raft) updateCommitIndex() {
-	// 从 commitIndex + 1 开始, 检查日志是否可以提交
-	for rf.commitIndex < len(rf.log)-1 {
-		count := 0
+	// 从日志的最后一个条目开始反向迭代，找到可以被提交的最高索引 N
+	for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
+		// 要提交的条目必须在大多数服务器上都存在
+		count := 1 // 先把自己算上
 		for i := range rf.peers {
-			if rf.matchIndex[i] >= rf.commitIndex+1 {
+			if i != rf.me && rf.matchIndex[i] >= N {
 				count++
 			}
 		}
 
-		// 检查是否超过半数节点复制了该日志
-		if count > len(rf.peers)/2 {
-			rf.commitIndex++
-
-			rf.applyCh <- raftapi.ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[rf.commitIndex].Command,
-				CommandIndex: rf.commitIndex,
+		// 如果大多数节点都复制了索引 N 的条目，并且该条目属于当前任期，
+		// 那么我们就可以更新 commitIndex。
+		if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
+			// 将从旧的 commitIndex 到新的 N 之间的所有条目应用到状态机
+			for i := rf.commitIndex + 1; i <= N; i++ {
+				rf.applyCh <- raftapi.ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[i].Command,
+					CommandIndex: i,
+				}
 			}
-		} else {
-			break
+			rf.commitIndex = N
+			return // 已经找到了最高的、可提交的新 commitIndex，完成更新后即可退出
 		}
 	}
 }

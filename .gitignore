@@ -1,3 +1,4 @@
 pkg/
 *-handin.tar.gz
 .idea
+src/raft1/result.txt
