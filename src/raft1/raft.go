@@ -9,12 +9,14 @@ package raft
 import (
 	// 	"bytes"
 
+	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	// 	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	tester "6.5840/tester1"
@@ -214,11 +216,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// 将命令附加到下一条日志
 
-	// DPrintf("将命令 %v 附加到日志", command)
-
 	// -- 附加到 leader 日志
 	index = len(rf.log)
 	rf.log = append(rf.log, log)
+
+	// 修改: 调用持久化
+	rf.persist()
+
+	DPrintf("Leader %d 接收到命令, log index=%d, term=%d", rf.me, index, term)
 
 	return index, term, isLeader
 }
@@ -273,8 +278,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateID // 记录下投给了谁
 
+	// 修改: 调用持久化
+	rf.persist()
+
 	// **关键**：同意投票后，重置自己的选举计时器
 	rf.resetElectionTimerLocked()
+
+	DPrintf("Node %d 在任期 %d 投票给 %d", rf.me, rf.currentTerm, args.CandidateID)
 }
 
 // AppendEntries RPC handler.
@@ -337,11 +347,37 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// --- 到此已经确定之前的日志已经吻合 ---
 
-	if len(args.Entries) > 0 {
-		// 将新日志附加到本节点日志中
-		rf.log = rf.log[:args.PrevLogIndex+1]
-		rf.log = append(rf.log, args.Entries...)
-		DPrintf("raft %d received new log successfully in term %d.", rf.me, rf.currentTerm)
+	logChanged := false
+
+	// 寻找冲突点并进行截断/追加
+	for i, entry := range args.Entries {
+		logIndex := args.PrevLogIndex + 1 + i
+		if logIndex < len(rf.log) {
+			// 如果在当前索引，本地日志的任期与 Leader 的不匹配
+			if rf.log[logIndex].Term != entry.Term {
+				// 删除此条目及其之后的所有条目
+				rf.log = rf.log[:logIndex]
+				logChanged = true
+				// 跳出循环，后续所有 entries 都需要追加
+				break
+			}
+		} else {
+			// 本地日志比 Leader 的短，直接跳出循环追加剩余部分
+			break
+		}
+	}
+
+	// 追加所有本地不存在的新条目
+	if len(rf.log) < args.PrevLogIndex+1+len(args.Entries) {
+		firstNewEntryIndex := len(rf.log) - (args.PrevLogIndex + 1)
+		rf.log = append(rf.log, args.Entries[firstNewEntryIndex:]...)
+		logChanged = true
+	}
+
+	// 只有在日志实际发生变化时才持久化
+	if logChanged {
+		rf.persist()
+		DPrintf("raft %d log changed and persisted.", rf.me)
 	}
 
 	// 检查 leader 是否提交了新的日志
@@ -446,6 +482,7 @@ func (rf *Raft) becomeFollowerLocked(term int) {
 	rf.state = Follower
 	rf.currentTerm = term
 	rf.votedFor = -1
+	rf.persist()
 	// 重置选举超时时间点
 	rf.resetElectionTimerLocked()
 }
@@ -457,6 +494,8 @@ func (rf *Raft) becomeCandidateLocked() {
 	rf.state = Candidate
 	rf.currentTerm++    // 任期加1
 	rf.votedFor = rf.me // 给自己投票
+
+	rf.persist()
 
 	// 重置下一次的选举计时器
 	rf.resetElectionTimerLocked()
@@ -683,24 +722,59 @@ func (rf *Raft) killed() bool {
 
 // --- 持久化 ---
 
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+// before you've implemented snapshots, you should pass nil as the
+// second argument to persister.Save().
+// after you've implemented snapshots, pass the current snapshot
+// (or nil if there's not yet a snapshot).
+func (rf *Raft) persist() {
+	// 新增持久化代码
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	// 编码需要持久化的字段
+	err := e.Encode(rf.currentTerm)
+	if err != nil {
+		DPrintf("编码 rf.currentTerm 失败: %v", err)
+	}
+	err = e.Encode(rf.votedFor)
+	if err != nil {
+		DPrintf("编码 rf.votedFor 失败: %v", err)
+	}
+	err = e.Encode(rf.log)
+	if err != nil {
+		DPrintf("编码 rf.log 失败: %v", err)
+	}
+	raftstate := w.Bytes()
+	// 保存状态，第二个参数 snapshot 暂时为 nil
+	rf.persister.Save(raftstate, nil)
+}
+
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var raftLog []LogEntry
+
+	// 按顺序解码
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&raftLog) != nil {
+		// 如果解码出错，可以记录日志或直接 panic
+		DPrintf("Node %d readPersist 解码失败", rf.me)
+	} else {
+		// 成功解码，恢复状态
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = raftLog
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -717,22 +791,4 @@ func (rf *Raft) PersistBytes() int {
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
 
-}
-
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-// before you've implemented snapshots, you should pass nil as the
-// second argument to persister.Save().
-// after you've implemented snapshots, pass the current snapshot
-// (or nil if there's not yet a snapshot).
-func (rf *Raft) persist() {
-	// Your code here (3C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
 }
