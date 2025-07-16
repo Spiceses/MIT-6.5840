@@ -67,10 +67,11 @@ type Raft struct {
 	matchIndex []int // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始化为 0，单调递增）
 
 	// --- 自定义实现所需的字段 ---
-	mu    sync.Mutex          // 用于保护此结构体中共享数据的互斥锁
-	state State               // 当前节点的状态 (Follower, Candidate, or Leader)
-	me    int                 // 当前节点在 peers 数组中的索引/ID
-	peers []*labrpc.ClientEnd // 所有对等节点的 RPC 客户端连接
+	mu        sync.Mutex          // 用于保护此结构体中共享数据的互斥锁
+	state     State               // 当前节点的状态 (Follower, Candidate, or Leader)
+	me        int                 // 当前节点在 peers 数组中的索引/ID
+	peers     []*labrpc.ClientEnd // 所有对等节点的 RPC 客户端连接
+	applyCond *sync.Cond          // 用于唤醒 applier goroutine 的条件变量
 
 	// --- 使用 time.Sleep 的核心字段 ---
 	// 替代 electionTimer，记录下一次选举超时的时间点
@@ -78,6 +79,10 @@ type Raft struct {
 
 	// (未来用于 K/V 存储) 一个 channel，用于将已提交的日志条目应用到状态机
 	applyCh chan raftapi.ApplyMsg
+
+	// 用于日志压缩的辅助字段
+	lastIncludedIndex int
+	lastIncludedTerm  int
 }
 
 // LogEntry 定义了日志条目的结构
@@ -157,6 +162,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		lastApplied: 0,
 	}
 
+	// 初始化条件变量
+	rf.applyCond = sync.NewCond(&rf.mu)
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
@@ -165,6 +173,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	// 启动专门的 applier goroutine
+	go rf.applyEntries()
 
 	DPrintf("raft 端点 %d 创建成功", me)
 
@@ -382,20 +393,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	// 检查 leader 是否提交了新的日志
 	if args.LeaderCommit > rf.commitIndex {
-		// 计算新的 commitIndex，取 Leader 的 commitIndex 和本地最新日志索引中的较小值
-		newCommitIndex := min(len(rf.log)-1, args.LeaderCommit)
-
-		// 将新提交的日志条目应用到状态机
-		for i := rf.commitIndex + 1; i <= newCommitIndex; i++ {
-			rf.applyCh <- raftapi.ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[i].Command,
-				CommandIndex: i,
-			}
-		}
-
-		// 更新 commitIndex
-		rf.commitIndex = newCommitIndex
+		// 更新 commitIndex，并唤醒消费者
+		rf.commitIndex = min(len(rf.log)-1, args.LeaderCommit)
+		rf.applyCond.Signal()
 	}
 
 	reply.Success = true
@@ -439,6 +439,41 @@ func (rf *Raft) ticker() {
 			// 这个逻辑被移到 `leaderHeartbeatLoop` 中，以简化 ticker。
 			// 这里什么都不做，让 Leader 的专用 goroutine 处理心跳。
 		}
+		rf.mu.Unlock()
+	}
+}
+
+// applyEntries 是一个长期运行的 goroutine，负责将已提交的日志条目应用到状态机。
+func (rf *Raft) applyEntries() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		// 等待条件：直到有新的日志被提交 (commitIndex > lastApplied)
+		for rf.lastApplied >= rf.commitIndex {
+			rf.applyCond.Wait()
+		}
+
+		// 在持有锁的情况下，快速读取需要应用的数据
+		commitIndex := rf.commitIndex
+		lastApplied := rf.lastApplied
+		entriesToApply := make([]LogEntry, commitIndex-lastApplied)
+		copy(entriesToApply, rf.log[lastApplied+1:commitIndex+1])
+
+		// 释放锁，然后执行可能耗时的 apply 操作
+		rf.mu.Unlock()
+
+		// 将待应用的日志条目发送到 applyCh
+		for i, entry := range entriesToApply {
+			applyIndex := lastApplied + 1 + i
+			rf.applyCh <- raftapi.ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: applyIndex,
+			}
+		}
+
+		// 再次获取锁，安全地更新 lastApplied
+		rf.mu.Lock()
+		rf.lastApplied = max(rf.lastApplied, commitIndex)
 		rf.mu.Unlock()
 	}
 }
@@ -687,16 +722,10 @@ func (rf *Raft) updateCommitIndex() {
 		// 如果大多数节点都复制了索引 N 的条目，并且该条目属于当前任期，
 		// 那么我们就可以更新 commitIndex。
 		if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
-			// 将从旧的 commitIndex 到新的 N 之间的所有条目应用到状态机
-			for i := rf.commitIndex + 1; i <= N; i++ {
-				rf.applyCh <- raftapi.ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[i].Command,
-					CommandIndex: i,
-				}
-			}
+			// 更新 commitIndex，并唤醒消费者
 			rf.commitIndex = N
-			return // 已经找到了最高的、可提交的新 commitIndex，完成更新后即可退出
+			rf.applyCond.Signal()
+			return
 		}
 	}
 }
@@ -730,6 +759,10 @@ func (rf *Raft) killed() bool {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
+	rf.persistSnap(nil)
+}
+
+func (rf *Raft) persistSnap(snapshot []byte) {
 	// 新增持久化代码
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -746,9 +779,17 @@ func (rf *Raft) persist() {
 	if err != nil {
 		DPrintf("编码 rf.log 失败: %v", err)
 	}
+	err = e.Encode(rf.lastIncludedIndex)
+	if err != nil {
+		DPrintf("编码 rf.lastIncludedIndex 失败: %v", err)
+	}
+	err = e.Encode(rf.lastIncludedTerm)
+	if err != nil {
+		DPrintf("编码 rf.lastIncludedTerm 失败: %v", err)
+	}
 	raftstate := w.Bytes()
 	// 保存状态，第二个参数 snapshot 暂时为 nil
-	rf.persister.Save(raftstate, nil)
+	rf.persister.Save(raftstate, snapshot)
 }
 
 // restore previously persisted state.
@@ -762,11 +803,15 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var raftLog []LogEntry
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 
 	// 按顺序解码
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&raftLog) != nil {
+		d.Decode(&raftLog) != nil ||
+		d.Decode(&lastIncludedIndex) != nil ||
+		d.Decode(&lastIncludedTerm) != nil {
 		// 如果解码出错，可以记录日志或直接 panic
 		DPrintf("Node %d readPersist 解码失败", rf.me)
 	} else {
@@ -784,11 +829,29 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
+// --- 日志压缩 ---
+
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (3D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	// 存储快照包含的最后一条 log 的 index 与 term
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = rf.log[index-rf.lastIncludedIndex].Term
+
+	// 截断日志
+	rf.log = rf.log[index-rf.lastIncludedIndex:]
+
+	// 提供占位符
+	rf.log[0] = LogEntry{
+		Term: rf.lastIncludedTerm,
+	}
+
+	// 持久化快照数据
+	rf.persistSnap(snapshot)
 }
