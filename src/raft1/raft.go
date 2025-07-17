@@ -156,11 +156,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		applyCh:     applyCh,
 		state:       Follower, // 初始状态为 Follower
 		currentTerm: 0,
-		votedFor:    -1,                  // -1 表示尚未投票
-		log:         make([]LogEntry, 1), // log index 从 1 开始，所以用一个空条目占据 index 0
+		votedFor:    -1, // -1 表示尚未投票
+		// log 初始化时就包含一个哨兵条目，对应 index 0
+		log:         make([]LogEntry, 1),
 		commitIndex: 0,
 		lastApplied: 0,
+		// 初始化时，快照为空，所以 lastIncludedIndex 和 lastIncludedTerm 都为 0
+		lastIncludedIndex: 0,
+		lastIncludedTerm:  0,
 	}
+	// 哨兵条目的任期为 0，没有命令
+	rf.log[0].Term = 0
+	rf.log[0].Command = nil
 
 	// 初始化条件变量
 	rf.applyCond = sync.NewCond(&rf.mu)
@@ -168,7 +175,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// 【重构】初始化选举超时时间点
+	// 初始化选举超时时间点
 	rf.resetElectionTimerLocked()
 
 	// start ticker goroutine to start elections
@@ -208,8 +215,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term := -1
 	isLeader := true
 
-	// Your code here (3B).
-
 	// 在整个函数执行期间上锁
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -228,7 +233,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// 将命令附加到下一条日志
 
 	// -- 附加到 leader 日志
-	index = len(rf.log)
+	index = len(rf.log) + rf.lastIncludedIndex
 	rf.log = append(rf.log, log)
 
 	// 修改: 调用持久化
@@ -275,8 +280,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// 规则 2: 投票资格检查
 	canVote := rf.votedFor == -1 || rf.votedFor == args.CandidateID
 
-	lastLogIndex := len(rf.log) - 1
-	lastLogTerm := rf.log[lastLogIndex].Term
+	// 使用辅助函数获取最后一条日志的绝对索引和任期
+	lastLogIndex := rf.getLastLogIndex()
+	lastLogTerm := rf.getLogTerm(lastLogIndex)
 
 	logIsUpToDate := args.LastLogTerm > lastLogTerm ||
 		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
@@ -333,68 +339,73 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// 重置选举超时计时器
 	rf.resetElectionTimerLocked()
 
-	// --- 【优化】日志冲突处理 ---
+	// --- 日志一致性检查 ---
 
-	// 检查 PrevLogIndex 是否越界
-	if args.PrevLogIndex >= len(rf.log) {
-		reply.XLen = len(rf.log)
-		reply.XTerm = -1 // 使用表示不存在该日志
+	// 检查 PrevLogIndex 是否小于我们的快照点，如果是，说明是过时的 RPC
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		// 可以直接回复成功，因为这部分日志已经被提交和快照了
+		reply.Success = true
+		return
+	}
+
+	// 检查 PrevLogIndex 是否在我们的日志范围内
+	if args.PrevLogIndex > rf.getLastLogIndex() {
+		reply.Success = false
+		reply.XLen = rf.getLastLogIndex() + 1 // Follower 的日志长度应该是 (绝对索引+1)
+		reply.XTerm = -1
 		reply.XIndex = -1
 		return
 	}
 
 	// 检查 PrevLogTerm 是否匹配
-	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.XTerm = rf.log[args.PrevLogIndex].Term
+	if rf.getLogTerm(args.PrevLogIndex) != args.PrevLogTerm {
+		reply.Success = false
+		reply.XTerm = rf.getLogTerm(args.PrevLogIndex)
 		// 找到任期为 XTerm 的第一个条目的索引
 		firstIndex := args.PrevLogIndex
-		for firstIndex > 0 && rf.log[firstIndex-1].Term == reply.XTerm {
+		for firstIndex > rf.lastIncludedIndex && rf.getLogTerm(firstIndex-1) == reply.XTerm {
 			firstIndex--
 		}
 		reply.XIndex = firstIndex
-		reply.XLen = len(rf.log)
+		reply.XLen = rf.getLastLogIndex() + 1
 		return
 	}
 
 	// --- 到此已经确定之前的日志已经吻合 ---
 
+	// --- 日志截断与追加 ---
 	logChanged := false
-
-	// 寻找冲突点并进行截断/追加
 	for i, entry := range args.Entries {
-		logIndex := args.PrevLogIndex + 1 + i
-		if logIndex < len(rf.log) {
-			// 如果在当前索引，本地日志的任期与 Leader 的不匹配
-			if rf.log[logIndex].Term != entry.Term {
-				// 删除此条目及其之后的所有条目
-				rf.log = rf.log[:logIndex]
-				logChanged = true
-				// 跳出循环，后续所有 entries 都需要追加
-				break
-			}
-		} else {
-			// 本地日志比 Leader 的短，直接跳出循环追加剩余部分
+		absoluteIndex := args.PrevLogIndex + 1 + i
+
+		// 如果这个绝对索引超过了我们的日志长度
+		if absoluteIndex > rf.getLastLogIndex() {
+			// 将所有剩余的 entries 追加到日志末尾
+			rf.log = append(rf.log, args.Entries[i:]...)
+			logChanged = true
+			break
+		}
+
+		// 如果存在冲突 (任期不同)
+		if rf.getLogTerm(absoluteIndex) != entry.Term {
+			// 截断日志
+			sliceIndex := rf.getSliceIndex(absoluteIndex)
+			rf.log = rf.log[:sliceIndex]
+			// 追加所有新条目
+			rf.log = append(rf.log, args.Entries[i:]...)
+			logChanged = true
 			break
 		}
 	}
 
-	// 追加所有本地不存在的新条目
-	if len(rf.log) < args.PrevLogIndex+1+len(args.Entries) {
-		firstNewEntryIndex := len(rf.log) - (args.PrevLogIndex + 1)
-		rf.log = append(rf.log, args.Entries[firstNewEntryIndex:]...)
-		logChanged = true
-	}
-
-	// 只有在日志实际发生变化时才持久化
 	if logChanged {
 		rf.persist()
-		DPrintf("raft %d log changed and persisted.", rf.me)
 	}
 
-	// 检查 leader 是否提交了新的日志
+	// --- 更新 commitIndex ---
 	if args.LeaderCommit > rf.commitIndex {
-		// 更新 commitIndex，并唤醒消费者
-		rf.commitIndex = min(len(rf.log)-1, args.LeaderCommit)
+		// commitIndex 取 LeaderCommit 和最新日志索引的较小值
+		rf.commitIndex = min(args.LeaderCommit, rf.getLastLogIndex())
 		rf.applyCond.Signal()
 	}
 
@@ -416,7 +427,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 
 // --- 实现 ---
 
-// 【重构】ticker 函数现在是一个统一的驱动循环。
+// ticker 函数现在是一个统一的驱动循环。
 // 它不再使用 select 和 time.Timer channel，而是定期（由 tickInterval 定义）
 // 醒来，并根据当前节点的状态和时间条件来决定是否需要执行操作
 // （发起选举或发送心跳）。
@@ -447,21 +458,29 @@ func (rf *Raft) ticker() {
 func (rf *Raft) applyEntries() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		// 等待条件：直到有新的日志被提交 (commitIndex > lastApplied)
 		for rf.lastApplied >= rf.commitIndex {
 			rf.applyCond.Wait()
 		}
 
-		// 在持有锁的情况下，快速读取需要应用的数据
-		commitIndex := rf.commitIndex
 		lastApplied := rf.lastApplied
-		entriesToApply := make([]LogEntry, commitIndex-lastApplied)
-		copy(entriesToApply, rf.log[lastApplied+1:commitIndex+1])
+		commitIndex := rf.commitIndex
 
-		// 释放锁，然后执行可能耗时的 apply 操作
+		// 检查是否有快照导致 lastApplied < lastIncludedIndex
+		// 如果是，说明有些日志已经被快照，我们应该从快照后开始应用
+		if lastApplied < rf.lastIncludedIndex {
+			// 这种情况不应该在 applyEntries 发生，而是在 InstallSnapshot 之后
+			// 但作为防御，可以处理
+			lastApplied = rf.lastIncludedIndex
+		}
+
+		startSliceIndex := rf.getSliceIndex(lastApplied + 1)
+		endSliceIndex := rf.getSliceIndex(commitIndex + 1)
+
+		entriesToApply := make([]LogEntry, endSliceIndex-startSliceIndex)
+		copy(entriesToApply, rf.log[startSliceIndex:endSliceIndex])
+
 		rf.mu.Unlock()
 
-		// 将待应用的日志条目发送到 applyCh
 		for i, entry := range entriesToApply {
 			applyIndex := lastApplied + 1 + i
 			rf.applyCh <- raftapi.ApplyMsg{
@@ -471,8 +490,8 @@ func (rf *Raft) applyEntries() {
 			}
 		}
 
-		// 再次获取锁，安全地更新 lastApplied
 		rf.mu.Lock()
+		// 使用 max 确保 lastApplied 不会因为旧的 commitIndex 值而回退
 		rf.lastApplied = max(rf.lastApplied, commitIndex)
 		rf.mu.Unlock()
 	}
@@ -541,8 +560,8 @@ func (rf *Raft) becomeCandidateLocked() {
 	args := RequestVoteArgs{
 		Term:         rf.currentTerm,
 		CandidateID:  rf.me,
-		LastLogIndex: len(rf.log) - 1,
-		LastLogTerm:  rf.log[len(rf.log)-1].Term,
+		LastLogIndex: rf.getLastLogIndex(),                // 使用辅助函数
+		LastLogTerm:  rf.getLogTerm(rf.getLastLogIndex()), // 使用辅助函数
 	}
 
 	// 为自己获得一票
@@ -587,7 +606,7 @@ func (rf *Raft) becomeCandidateLocked() {
 	}
 }
 
-// 【重构】`becomeLeader` 改为 `becomeLeaderLocked`，假设已持有锁。
+// 假设已持有锁。
 func (rf *Raft) becomeLeaderLocked() {
 	// 调用此函数时，必须已经持有锁且状态为 Candidate
 	if rf.state != Candidate {
@@ -602,11 +621,15 @@ func (rf *Raft) becomeLeaderLocked() {
 	// -- matchIndex 切片值初始化为 0
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+
+	// 初始化 nextIndex 为 Leader 日志的下一个绝对索引
+	leaderNextIndex := rf.getLastLogIndex() + 1
+
 	for i := range rf.peers {
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = leaderNextIndex
+		// matchIndex 初始化为 0 是正确的
 	}
 
-	// 成为 Leader 后，启动一个专用的 goroutine 来周期性地发送心跳。
 	go rf.leaderHeartbeatLoop()
 }
 
@@ -621,15 +644,27 @@ func (rf *Raft) sendHeartbeatsLocked() {
 			continue
 		}
 
-		prevLogIndex := rf.nextIndex[i] - 1
-		prevLogTerm := rf.log[prevLogIndex].Term
+		// 如果 follower 需要的日志已经被快照
+		if rf.nextIndex[i] <= rf.lastIncludedIndex {
+			// 这里应该触发 InstallSnapshot RPC，但根据你的要求先不实现
+			// 作为一个简化，我们可以先跳过，或者发送一个空的 AppendEntries
+			// 在实际实现中，这里必须发送快照
+			continue
+		}
 
-		// 构造 rpc 参数
+		prevLogIndex := rf.nextIndex[i] - 1
+		prevLogTerm := rf.getLogTerm(prevLogIndex) // 使用辅助函数
+
+		// 获取要发送的日志条目 (修正后)
+		sliceStartIndex := rf.getSliceIndex(rf.nextIndex[i])
+		entriesToSend := make([]LogEntry, len(rf.log[sliceStartIndex:]))
+		copy(entriesToSend, rf.log[sliceStartIndex:])
+
 		args := AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderID:     rf.me,
 			LeaderCommit: rf.commitIndex,
-			Entries:      append(make([]LogEntry, 0), rf.log[rf.nextIndex[i]:]...),
+			Entries:      entriesToSend,
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
 		}
@@ -710,8 +745,13 @@ func (rf *Raft) sendHeartbeatsLocked() {
 // 更新 commitIndex 的逻辑, 假设已持有锁
 func (rf *Raft) updateCommitIndex() {
 	// 从日志的最后一个条目开始反向迭代，找到可以被提交的最高索引 N
-	for N := len(rf.log) - 1; N > rf.commitIndex; N-- {
-		// 要提交的条目必须在大多数服务器上都存在
+	// 循环变量 N 现在是绝对索引
+	for N := rf.getLastLogIndex(); N > rf.commitIndex; N-- {
+		// 关键：要提交的日志必须是当前任期的。Raft 论文 5.4.2 节
+		if rf.getLogTerm(N) != rf.currentTerm {
+			continue
+		}
+
 		count := 1 // 先把自己算上
 		for i := range rf.peers {
 			if i != rf.me && rf.matchIndex[i] >= N {
@@ -719,12 +759,11 @@ func (rf *Raft) updateCommitIndex() {
 			}
 		}
 
-		// 如果大多数节点都复制了索引 N 的条目，并且该条目属于当前任期，
-		// 那么我们就可以更新 commitIndex。
-		if count > len(rf.peers)/2 && rf.log[N].Term == rf.currentTerm {
-			// 更新 commitIndex，并唤醒消费者
+		if count > len(rf.peers)/2 {
+			// 找到了可以提交的 N
 			rf.commitIndex = N
 			rf.applyCond.Signal()
+			// 找到第一个满足条件的就可以退出
 			return
 		}
 	}
@@ -794,7 +833,11 @@ func (rf *Raft) persistSnap(snapshot []byte) {
 
 // restore previously persisted state.
 func (rf *Raft) readPersist(data []byte) {
-	if len(data) < 1 { // bootstrap without any state?
+	if len(data) < 1 {
+		// 如果没有持久化状态，确保哨兵存在
+		rf.log = make([]LogEntry, 1)
+		rf.log[0].Term = 0
+		rf.log[0].Command = nil
 		return
 	}
 
@@ -836,22 +879,57 @@ func (rf *Raft) PersistBytes() int {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 存储快照包含的最后一条 log 的 index 与 term
-	rf.lastIncludedIndex = index
-	rf.lastIncludedTerm = rf.log[index-rf.lastIncludedIndex].Term
-
-	// 截断日志
-	rf.log = rf.log[index-rf.lastIncludedIndex:]
-
-	// 提供占位符
-	rf.log[0] = LogEntry{
-		Term: rf.lastIncludedTerm,
+	if index <= rf.lastIncludedIndex {
+		return
 	}
 
-	// 持久化快照数据
+	// 获取要被快照覆盖的最后一个条目的任期
+	newLastIncludedTerm := rf.getLogTerm(index)
+	sliceIndex := rf.getSliceIndex(index)
+
+	// 创建一个新的日志切片
+	// 新的长度是原长度减去被快照覆盖的条目数
+	newLog := make([]LogEntry, len(rf.log)-sliceIndex)
+	copy(newLog, rf.log[sliceIndex:])
+
+	// 更新 Raft 状态
+	rf.log = newLog
+	rf.lastIncludedIndex = index
+	rf.lastIncludedTerm = newLastIncludedTerm
+
+	// rf.log[0] 现在就是新的哨兵条目，它的 Term 必须是 newLastIncludedTerm。
+	// 因为 copy 操作已经把正确的条目（原来在 rf.log[sliceIndex]）复制到了 newLog[0]，
+	// 所以这里的 Term 已经是正确的了。我们只需要确保它的 Command 为 nil。
+	rf.log[0].Command = nil
+
+	// 持久化
 	rf.persistSnap(snapshot)
+}
+
+// --- 功能函数, 区分相对索引与绝对索引 ---
+
+// getSliceIndex 将绝对日志索引转换为 rf.log 切片的索引
+func (rf *Raft) getSliceIndex(absoluteIndex int) int {
+	// 假设 absoluteIndex 总是 >= rf.lastIncludedIndex
+	return absoluteIndex - rf.lastIncludedIndex
+}
+
+// getAbsoluteIndex 将 rf.log 切片的索引转换为绝对日志索引
+func (rf *Raft) getAbsoluteIndex(sliceIndex int) int {
+	return rf.lastIncludedIndex + sliceIndex
+}
+
+// getLastLogIndex 返回日志中最后一个条目的绝对索引
+func (rf *Raft) getLastLogIndex() int {
+	// len(rf.log) - 1 是最后一个元素的 slice index
+	return rf.getAbsoluteIndex(len(rf.log) - 1)
+}
+
+// getLogTerm 返回指定绝对索引的日志条目的任期
+func (rf *Raft) getLogTerm(absoluteIndex int) int {
+	// 因为有哨兵，所以 absoluteIndex 不会小于 lastIncludedIndex
+	return rf.log[rf.getSliceIndex(absoluteIndex)].Term
 }
