@@ -83,6 +83,7 @@ type Raft struct {
 	// 用于日志压缩的辅助字段
 	lastIncludedIndex int
 	lastIncludedTerm  int
+	snapshot          []byte
 }
 
 // LogEntry 定义了日志条目的结构
@@ -126,6 +127,17 @@ type AppendEntriesReply struct {
 	XLen   int // Follower 日志的长度
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	Data              []byte
+	LastIncludedIndex int
+	LastIncludedTerm  int
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 // --- 接口 ---
 
 // the service or tester wants to create a Raft server. the ports
@@ -146,8 +158,7 @@ type AppendEntriesReply struct {
 // 并且最初也持有任何最近保存的状态。
 // applyCh是一个通道，测试器或服务期望Raft在此通道上发送ApplyMsg消息。
 // Make()必须快速返回，因此它应该为任何长时间运行的工作启动goroutine。
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *tester.Persister, applyCh chan raftapi.ApplyMsg) raftapi.Raft {
 	// 初始化 raft 节点状态
 	rf := &Raft{
 		peers:       peers,
@@ -164,6 +175,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		// 初始化时，快照为空，所以 lastIncludedIndex 和 lastIncludedTerm 都为 0
 		lastIncludedIndex: 0,
 		lastIncludedTerm:  0,
+		snapshot:          persister.ReadSnapshot(),
 	}
 	// 哨兵条目的任期为 0，没有命令
 	rf.log[0].Term = 0
@@ -236,7 +248,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.log) + rf.lastIncludedIndex
 	rf.log = append(rf.log, log)
 
-	// 修改: 调用持久化
+	// 调用持久化
 	rf.persist()
 
 	DPrintf("Leader %d 接收到命令, log index=%d, term=%d", rf.me, index, term)
@@ -412,6 +424,46 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 }
 
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = max(rf.currentTerm, args.Term)
+
+	// 检查 rpc 是否过期
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	rf.becomeFollowerLocked(reply.Term)
+
+	// 如果快照的索引小于等于自己的 commitIndex，说明这个快照是过时的
+	if args.LastIncludedIndex <= rf.commitIndex {
+		return
+	}
+
+	// 更新 raft 状态
+	rf.snapshot = args.Data
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	rf.commitIndex = max(rf.commitIndex, args.LastIncludedIndex)
+	rf.lastApplied = max(rf.lastApplied, args.LastIncludedIndex)
+	newLog := []LogEntry{{Term: args.LastIncludedTerm, Command: nil}}
+	rf.log = newLog
+
+	// 持久化
+	rf.persist()
+
+	go func() {
+		rf.applyCh <- raftapi.ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+	}()
+}
+
 // sendRequestVote 发送投票请求
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
@@ -422,6 +474,13 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	// DPrintf("raft %d send AppendEntries to %d", args.LeaderID, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
+
+// sendAppendEntries 发送心跳或日志
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	// DPrintf("raft %d send AppendEntries to %d", args.LeaderID, server)
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
@@ -646,21 +705,49 @@ func (rf *Raft) sendHeartbeatsLocked() {
 
 		// 如果 follower 需要的日志已经被快照
 		if rf.nextIndex[i] <= rf.lastIncludedIndex {
-			// 这里应该触发 InstallSnapshot RPC，但根据你的要求先不实现
-			// 作为一个简化，我们可以先跳过，或者发送一个空的 AppendEntries
-			// 在实际实现中，这里必须发送快照
+			// 要发送的 log 已经在快照中了, 我们需要让 follower 直接安装快照
+
+			// 构造 snapshot 参数
+			installSnapshotArgs := InstallSnapshotArgs{
+				Term:              rf.currentTerm,
+				Data:              rf.persister.ReadSnapshot(),
+				LastIncludedIndex: rf.lastIncludedIndex,
+				LastIncludedTerm:  rf.lastIncludedTerm,
+			}
+
+			go func(i int, args InstallSnapshotArgs) {
+				reply := InstallSnapshotReply{}
+				ok := rf.sendInstallSnapshot(i, &args, &reply)
+				if !ok {
+					return
+				}
+
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				// 处理 snapshot rpc 回复
+				if reply.Term > rf.currentTerm {
+					rf.becomeFollowerLocked(reply.Term)
+					return
+				}
+
+				rf.nextIndex[i] = args.LastIncludedIndex + 1
+				rf.matchIndex[i] = args.LastIncludedIndex
+			}(i, installSnapshotArgs)
+
 			continue
 		}
 
 		prevLogIndex := rf.nextIndex[i] - 1
-		prevLogTerm := rf.getLogTerm(prevLogIndex) // 使用辅助函数
+		prevLogTerm := rf.getLogTerm(prevLogIndex)
 
-		// 获取要发送的日志条目 (修正后)
+		// 获取要发送的日志条目
 		sliceStartIndex := rf.getSliceIndex(rf.nextIndex[i])
+
 		entriesToSend := make([]LogEntry, len(rf.log[sliceStartIndex:]))
 		copy(entriesToSend, rf.log[sliceStartIndex:])
 
-		args := AppendEntriesArgs{
+		appendEntriesArgs := AppendEntriesArgs{
 			Term:         rf.currentTerm,
 			LeaderID:     rf.me,
 			LeaderCommit: rf.commitIndex,
@@ -693,9 +780,12 @@ func (rf *Raft) sendHeartbeatsLocked() {
 
 			// --- 仍然是 leader ---
 
-			// -- follower 的日志冲突了
+			// 检测 follower 的日志是否冲突
 			if !reply.Success {
 				// 【优化】使用 Follower 返回的信息进行快速回退
+				//  最终我们通过更新 nextIndex[i] 来让下一次心跳消息发送合理的日志切片
+
+				// 检测冲突情况是 follower 的日志过短还是条目冲突
 				if reply.XTerm == -1 {
 					// 情况1: Follower的日志太短，没有PrevLogIndex
 					// 直接将 nextIndex 设置为 Follower 日志的长度
@@ -725,6 +815,7 @@ func (rf *Raft) sendHeartbeatsLocked() {
 				if rf.nextIndex[i] < 1 {
 					rf.nextIndex[i] = 1
 				}
+
 				return
 			}
 
@@ -738,7 +829,7 @@ func (rf *Raft) sendHeartbeatsLocked() {
 
 			// 检查是否可以更新 commitIndex
 			rf.updateCommitIndex()
-		}(i, args)
+		}(i, appendEntriesArgs)
 	}
 }
 
@@ -798,11 +889,6 @@ func (rf *Raft) killed() bool {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	rf.persistSnap(nil)
-}
-
-func (rf *Raft) persistSnap(snapshot []byte) {
-	// 新增持久化代码
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	// 编码需要持久化的字段
@@ -827,11 +913,12 @@ func (rf *Raft) persistSnap(snapshot []byte) {
 		DPrintf("编码 rf.lastIncludedTerm 失败: %v", err)
 	}
 	raftstate := w.Bytes()
-	// 保存状态，第二个参数 snapshot 暂时为 nil
-	rf.persister.Save(raftstate, snapshot)
+
+	rf.persister.Save(raftstate, rf.snapshot)
 }
 
 // restore previously persisted state.
+// 服务器初始化或重启时应读取持久化的状态
 func (rf *Raft) readPersist(data []byte) {
 	if len(data) < 1 {
 		// 如果没有持久化状态，确保哨兵存在
@@ -862,6 +949,11 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = raftLog
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
+		// 其他需要更新的 raft 状态
+		rf.commitIndex = lastIncludedIndex
+		rf.lastApplied = lastIncludedIndex
 	}
 }
 
@@ -882,9 +974,13 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	// 检测是否快照是否更旧
 	if index <= rf.lastIncludedIndex {
 		return
 	}
+
+	// 缓存快照
+	rf.snapshot = snapshot
 
 	// 获取要被快照覆盖的最后一个条目的任期
 	newLastIncludedTerm := rf.getLogTerm(index)
@@ -893,6 +989,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// 创建一个新的日志切片
 	// 新的长度是原长度减去被快照覆盖的条目数
 	newLog := make([]LogEntry, len(rf.log)-sliceIndex)
+	// 简单地进行 rf.log = rf.log[sliceIndex:] 并不会释放底层数组的引用
 	copy(newLog, rf.log[sliceIndex:])
 
 	// 更新 Raft 状态
@@ -906,7 +1003,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.log[0].Command = nil
 
 	// 持久化
-	rf.persistSnap(snapshot)
+	rf.persist()
 }
 
 // --- 功能函数, 区分相对索引与绝对索引 ---
