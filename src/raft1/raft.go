@@ -44,10 +44,15 @@ const (
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
-	persister *tester.Persister // Object to hold this peer's persisted state
-	dead      int32             // set by Kill()
+	mu sync.Mutex // 用于保护此结构体中共享数据的互斥锁
 
-	// Your data here (3A, 3B, 3C).
+	peers            []*labrpc.ClientEnd // 所有对等节点的 RPC 客户端连接
+	me               int                 // 当前节点在 peers 数组中的索引/ID
+	persister        *tester.Persister   // Object to hold this peer's persisted state
+	state            State               // 当前节点的状态 (Follower, Candidate, or Leader)
+	dead             int32               // set by Kill()
+	electionDeadline time.Time           // 记录下一次选举超时的时间点
+
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
@@ -66,24 +71,17 @@ type Raft struct {
 	nextIndex  []int // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始化为领导者最后的日志索引+1）
 	matchIndex []int // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始化为 0，单调递增）
 
-	// --- 自定义实现所需的字段 ---
-	mu        sync.Mutex          // 用于保护此结构体中共享数据的互斥锁
-	state     State               // 当前节点的状态 (Follower, Candidate, or Leader)
-	me        int                 // 当前节点在 peers 数组中的索引/ID
-	peers     []*labrpc.ClientEnd // 所有对等节点的 RPC 客户端连接
-	applyCond *sync.Cond          // 用于唤醒 applier goroutine 的条件变量
-
-	// --- 使用 time.Sleep 的核心字段 ---
-	// 替代 electionTimer，记录下一次选举超时的时间点
-	electionDeadline time.Time
-
-	// (未来用于 K/V 存储) 一个 channel，用于将已提交的日志条目应用到状态机
-	applyCh chan raftapi.ApplyMsg
-
 	// 用于日志压缩的辅助字段
 	lastIncludedIndex int
 	lastIncludedTerm  int
 	snapshot          []byte
+
+	// (未来用于 K/V 存储) 一个 channel，用于将已提交的日志条目应用到状态机
+	applyCh chan raftapi.ApplyMsg
+
+	// --- 条件变量 ---
+	applyCond  *sync.Cond // 用于唤醒 applier goroutine 的条件变量
+	commitCond *sync.Cond // 【新增】用于唤醒 commit-updater goroutine 的条件变量
 }
 
 // LogEntry 定义了日志条目的结构
@@ -183,6 +181,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *tester.Persister, applyC
 
 	// 初始化条件变量
 	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.commitCond = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -195,6 +194,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *tester.Persister, applyC
 
 	// 启动专门的 applier goroutine
 	go rf.applyEntries()
+
+	// 【新增】启动专门的 commit-updater goroutine
+	go rf.commitUpdater()
 
 	DPrintf("raft 端点 %d 创建成功", me)
 
@@ -231,8 +233,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	term = rf.currentTerm
+
 	// 检查是否为领导者
-	term, isLeader = rf.GetStateLocked()
+	isLeader = rf.state == Leader
 	if !isLeader {
 		return index, term, isLeader
 	}
@@ -259,16 +263,30 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	// Your code here (3A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.GetStateLocked()
-}
-
-func (rf *Raft) GetStateLocked() (int, bool) {
 	term := rf.currentTerm
 	isleader := (rf.state == Leader)
 	return term, isleader
+}
+
+// the tester doesn't halt goroutines created by Raft after each test,
+// but it does call the Kill() method. your code can use killed() to
+// check whether Kill() has been called. the use of atomic avoids the
+// need for a lock.
+//
+// the issue is that long-running goroutines use memory and may chew
+// up CPU time, perhaps causing later tests to fail and generating
+// confusing debug output. any goroutine with a long-running loop
+// should call killed() to check whether it should stop.
+func (rf *Raft) Kill() {
+	atomic.StoreInt32(&rf.dead, 1)
+	// Your code here, if desired.
+}
+
+func (rf *Raft) killed() bool {
+	z := atomic.LoadInt32(&rf.dead)
+	return z == 1
 }
 
 // --- RPC 调用 ---
@@ -484,7 +502,9 @@ func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply
 	return ok
 }
 
-// --- 实现 ---
+// --- 多线程实现 ---
+
+// ---- 计时线程(follower, candidate) ----
 
 // ticker 函数现在是一个统一的驱动循环。
 // 它不再使用 select 和 time.Timer channel，而是定期（由 tickInterval 定义）
@@ -512,6 +532,8 @@ func (rf *Raft) ticker() {
 		rf.mu.Unlock()
 	}
 }
+
+// ---- 应用日志线程(all) ----
 
 // applyEntries 是一个长期运行的 goroutine，负责将已提交的日志条目应用到状态机。
 func (rf *Raft) applyEntries() {
@@ -556,6 +578,52 @@ func (rf *Raft) applyEntries() {
 	}
 }
 
+// ---- 提交日志线程(leader) ----
+
+// commitUpdater 是一个长期运行的 goroutine，负责检查并更新 leader 的 commitIndex
+func (rf *Raft) commitUpdater() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		// 等待来自 RPC 回复处理器的信号
+		// Wait 会自动释放锁并在等待时阻塞；被唤醒后会重新获取锁
+		rf.commitCond.Wait()
+
+		// 被唤醒后，我们持有锁，可以安全地调用 updateCommitIndex
+		rf.updateCommitIndex()
+
+		rf.mu.Unlock()
+	}
+}
+
+// 更新 commitIndex 的逻辑, 假设已持有锁
+func (rf *Raft) updateCommitIndex() {
+	// 从日志的最后一个条目开始反向迭代，找到可以被提交的最高索引 N
+	// 循环变量 N 现在是绝对索引
+	for N := rf.getLastLogIndex(); N > rf.commitIndex; N-- {
+		// 关键：要提交的日志必须是当前任期的。Raft 论文 5.4.2 节
+		if rf.getLogTerm(N) != rf.currentTerm {
+			continue
+		}
+
+		count := 1 // 先把自己算上
+		for i := range rf.peers {
+			if i != rf.me && rf.matchIndex[i] >= N {
+				count++
+			}
+		}
+
+		if count > len(rf.peers)/2 {
+			// 找到了可以提交的 N
+			rf.commitIndex = N
+			rf.applyCond.Signal()
+			// 找到第一个满足条件的就可以退出
+			return
+		}
+	}
+}
+
+// ---- 心跳线程(leader) ----
+
 // 【重构】为 Leader 状态创建一个专门的、清晰的循环来发送心跳。
 // 这个 goroutine 在节点成为 Leader 时启动，并在其不再是 Leader 时退出。
 func (rf *Raft) leaderHeartbeatLoop() {
@@ -575,121 +643,6 @@ func (rf *Raft) leaderHeartbeatLoop() {
 		// 等待一个心跳间隔
 		time.Sleep(heartbeatInterval)
 	}
-}
-
-// 【重构】生成一个随机的选举超时时间
-func randomizedElectionTimeout() time.Duration {
-	return electionTimeoutBase + time.Duration(rand.Intn(150))*time.Millisecond
-}
-
-// 【重构】这是一个新的辅助函数，用于重置选举超时时间点。
-// 它取代了之前对 `electionTimer.Reset()` 的调用。
-// "Locked" 后缀表示此函数期望在调用时已经持有锁。
-func (rf *Raft) resetElectionTimerLocked() {
-	rf.electionDeadline = time.Now().Add(randomizedElectionTimeout())
-}
-
-// becomeFollowerLocked 是实际的状态转换逻辑，假设调用者已持有锁。
-func (rf *Raft) becomeFollowerLocked(term int) {
-	// DPrintf("Node %d became Follower in term %d", rf.me, rf.currentTerm)
-	rf.state = Follower
-	rf.currentTerm = term
-	rf.votedFor = -1
-	rf.persist()
-	// 重置选举超时时间点
-	rf.resetElectionTimerLocked()
-}
-
-// 【重构】`becomeCandidate` 现在是一个内部函数 `becomeCandidateLocked`。
-// 它假设调用时已持有锁，并负责状态转换和发起并发的投票请求。
-// ticker 循环会在选举超时后调用它。
-func (rf *Raft) becomeCandidateLocked() {
-	rf.state = Candidate
-	rf.currentTerm++    // 任期加1
-	rf.votedFor = rf.me // 给自己投票
-
-	rf.persist()
-
-	// 重置下一次的选举计时器
-	rf.resetElectionTimerLocked()
-
-	DPrintf("Node %d became Candidate, starting election for term %d", rf.me, rf.currentTerm)
-
-	// 准备 RequestVote RPC 的参数
-	args := RequestVoteArgs{
-		Term:         rf.currentTerm,
-		CandidateID:  rf.me,
-		LastLogIndex: rf.getLastLogIndex(),                // 使用辅助函数
-		LastLogTerm:  rf.getLogTerm(rf.getLastLogIndex()), // 使用辅助函数
-	}
-
-	// 为自己获得一票
-	// 使用原子变量，因为它会被多个 goroutine 并发地增加
-	var votesGranted int32 = 1
-
-	// 并发地向所有其他节点发送投票请求
-	for i := range rf.peers {
-		if i == rf.me {
-			continue
-		}
-
-		go func(serverIndex int) {
-			reply := RequestVoteReply{}
-			ok := rf.sendRequestVote(serverIndex, &args, &reply)
-			if !ok {
-				return
-			}
-
-			rf.mu.Lock()
-			defer rf.mu.Unlock()
-
-			// 如果对方的任期比我们还大，说明我们已经过时了，立刻转为 Follower
-			if reply.Term > rf.currentTerm {
-				rf.becomeFollowerLocked(reply.Term)
-				return
-			}
-
-			// 检查我们是否还在当初发起选举时的状态
-			if rf.state != Candidate || rf.currentTerm != args.Term {
-				return
-			}
-
-			if reply.VoteGranted {
-				atomic.AddInt32(&votesGranted, 1)
-				// 检查是否获得超过半数的选票
-				if atomic.LoadInt32(&votesGranted) > int32(len(rf.peers)/2) {
-					rf.becomeLeaderLocked()
-				}
-			}
-		}(i)
-	}
-}
-
-// 假设已持有锁。
-func (rf *Raft) becomeLeaderLocked() {
-	// 调用此函数时，必须已经持有锁且状态为 Candidate
-	if rf.state != Candidate {
-		return
-	}
-
-	rf.state = Leader
-	DPrintf("Node %d became Leader for term %d!", rf.me, rf.currentTerm)
-
-	// 成为 Leader 后，需要初始化 nextIndex 和 matchIndex
-	// -- nextIndex 切片值初始化为 log 的最后一个索引 + 1
-	// -- matchIndex 切片值初始化为 0
-	rf.nextIndex = make([]int, len(rf.peers))
-	rf.matchIndex = make([]int, len(rf.peers))
-
-	// 初始化 nextIndex 为 Leader 日志的下一个绝对索引
-	leaderNextIndex := rf.getLastLogIndex() + 1
-
-	for i := range rf.peers {
-		rf.nextIndex[i] = leaderNextIndex
-		// matchIndex 初始化为 0 是正确的
-	}
-
-	go rf.leaderHeartbeatLoop()
 }
 
 // 它在 `leaderHeartbeatLoop` 中被调用，调用时已持有锁。
@@ -828,55 +781,107 @@ func (rf *Raft) sendHeartbeatsLocked() {
 			}
 
 			// 检查是否可以更新 commitIndex
-			rf.updateCommitIndex()
+			rf.commitCond.Signal()
 		}(i, appendEntriesArgs)
 	}
 }
 
-// 更新 commitIndex 的逻辑, 假设已持有锁
-func (rf *Raft) updateCommitIndex() {
-	// 从日志的最后一个条目开始反向迭代，找到可以被提交的最高索引 N
-	// 循环变量 N 现在是绝对索引
-	for N := rf.getLastLogIndex(); N > rf.commitIndex; N-- {
-		// 关键：要提交的日志必须是当前任期的。Raft 论文 5.4.2 节
-		if rf.getLogTerm(N) != rf.currentTerm {
+// --- 状态转换逻辑 ---
+
+// becomeFollowerLocked 是实际的状态转换逻辑，假设调用者已持有锁。
+func (rf *Raft) becomeFollowerLocked(term int) {
+	// DPrintf("Node %d became Follower in term %d", rf.me, rf.currentTerm)
+	rf.state = Follower
+	rf.currentTerm = term
+	rf.votedFor = -1
+	rf.persist()
+	// 重置选举超时时间点
+	rf.resetElectionTimerLocked()
+}
+
+// 【重构】`becomeCandidate` 现在是一个内部函数 `becomeCandidateLocked`。
+// 它假设调用时已持有锁，并负责状态转换和发起并发的投票请求。
+// ticker 循环会在选举超时后调用它。
+func (rf *Raft) becomeCandidateLocked() {
+	rf.state = Candidate
+	rf.currentTerm++    // 任期加1
+	rf.votedFor = rf.me // 给自己投票
+
+	rf.persist()
+
+	// 重置下一次的选举计时器
+	rf.resetElectionTimerLocked()
+
+	DPrintf("Node %d became Candidate, starting election for term %d", rf.me, rf.currentTerm)
+
+	// 准备 RequestVote RPC 的参数
+	args := RequestVoteArgs{
+		Term:         rf.currentTerm,
+		CandidateID:  rf.me,
+		LastLogIndex: rf.getLastLogIndex(),
+		LastLogTerm:  rf.getLogTerm(rf.getLastLogIndex()),
+	}
+
+	// 为自己获得一票
+	// 使用原子变量，因为它会被多个 goroutine 并发地增加
+	count := 1
+
+	// 并发地向所有其他节点发送投票请求
+	for i := range rf.peers {
+		if i == rf.me {
 			continue
 		}
 
-		count := 1 // 先把自己算上
-		for i := range rf.peers {
-			if i != rf.me && rf.matchIndex[i] >= N {
-				count++
+		go func(serverIndex int) {
+			reply := RequestVoteReply{}
+			ok := rf.sendRequestVote(serverIndex, &args, &reply)
+			if !ok {
+				return
 			}
-		}
 
-		if count > len(rf.peers)/2 {
-			// 找到了可以提交的 N
-			rf.commitIndex = N
-			rf.applyCond.Signal()
-			// 找到第一个满足条件的就可以退出
-			return
-		}
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			// 如果对方的任期比我们还大，说明我们已经过时了，立刻转为 Follower
+			if reply.Term > rf.currentTerm {
+				rf.becomeFollowerLocked(reply.Term)
+				return
+			}
+
+			// 检查我们是否还在当初发起选举时的状态
+			if rf.state != Candidate || rf.currentTerm != args.Term {
+				return
+			}
+
+			if reply.VoteGranted {
+				count++
+				// 检查是否获得超过半数的选票
+				if count > len(rf.peers)/2 {
+					rf.becomeLeaderLocked()
+				}
+			}
+		}(i)
 	}
 }
 
-// the tester doesn't halt goroutines created by Raft after each test,
-// but it does call the Kill() method. your code can use killed() to
-// check whether Kill() has been called. the use of atomic avoids the
-// need for a lock.
-//
-// the issue is that long-running goroutines use memory and may chew
-// up CPU time, perhaps causing later tests to fail and generating
-// confusing debug output. any goroutine with a long-running loop
-// should call killed() to check whether it should stop.
-func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
-}
+// 假设已持有锁。
+func (rf *Raft) becomeLeaderLocked() {
+	rf.state = Leader
+	DPrintf("Node %d became Leader for term %d!", rf.me, rf.currentTerm)
 
-func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
-	return z == 1
+	// 成为 Leader 后，需要初始化 nextIndex 和 matchIndex
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	// 初始化 nextIndex 为 Leader 日志的下一个绝对索引
+	leaderNextIndex := rf.getLastLogIndex() + 1
+
+	for i := range rf.peers {
+		rf.nextIndex[i] = leaderNextIndex
+		// matchIndex 初始化为 0
+	}
+
+	go rf.leaderHeartbeatLoop()
 }
 
 // --- 持久化 ---
@@ -964,8 +969,6 @@ func (rf *Raft) PersistBytes() int {
 	return rf.persister.RaftStateSize()
 }
 
-// --- 日志压缩 ---
-
 // the service says it has created a snapshot that has
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
@@ -974,7 +977,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// 检测是否快照是否更旧
+	// 检测是否快照是否更旧, 防止回滚
 	if index <= rf.lastIncludedIndex {
 		return
 	}
@@ -984,15 +987,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 	// 获取要被快照覆盖的最后一个条目的任期
 	newLastIncludedTerm := rf.getLogTerm(index)
-	sliceIndex := rf.getSliceIndex(index)
 
 	// 创建一个新的日志切片
 	// 新的长度是原长度减去被快照覆盖的条目数
-	newLog := make([]LogEntry, len(rf.log)-sliceIndex)
 	// 简单地进行 rf.log = rf.log[sliceIndex:] 并不会释放底层数组的引用
+	sliceIndex := rf.getSliceIndex(index)
+	newLog := make([]LogEntry, len(rf.log)-sliceIndex)
 	copy(newLog, rf.log[sliceIndex:])
 
-	// 更新 Raft 状态
+	// --- 更新 Raft 状态 ---
+
 	rf.log = newLog
 	rf.lastIncludedIndex = index
 	rf.lastIncludedTerm = newLastIncludedTerm
@@ -1006,7 +1010,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	rf.persist()
 }
 
-// --- 功能函数, 区分相对索引与绝对索引 ---
+// --- 功能函数 ---
 
 // getSliceIndex 将绝对日志索引转换为 rf.log 切片的索引
 func (rf *Raft) getSliceIndex(absoluteIndex int) int {
@@ -1029,4 +1033,15 @@ func (rf *Raft) getLastLogIndex() int {
 func (rf *Raft) getLogTerm(absoluteIndex int) int {
 	// 因为有哨兵，所以 absoluteIndex 不会小于 lastIncludedIndex
 	return rf.log[rf.getSliceIndex(absoluteIndex)].Term
+}
+
+// 辅助函数，用于重置选举超时时间点。
+// "Locked" 后缀表示此函数期望在调用时已经持有锁。
+func (rf *Raft) resetElectionTimerLocked() {
+	rf.electionDeadline = time.Now().Add(randomizedElectionTimeout())
+}
+
+// 生成一个随机的选举超时时间
+func randomizedElectionTimeout() time.Duration {
+	return electionTimeoutBase + time.Duration(rand.Intn(150))*time.Millisecond
 }
